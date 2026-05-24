@@ -93,3 +93,45 @@ def test_shadow_lifecycle(client):
 def test_policy_invalid_mode_rejected(client):
     r = client.put("/components/x/policy", json={"mode": "yolo"})
     assert r.status_code == 422
+
+
+# --- Authentication tests ---
+
+
+@pytest.fixture
+def auth_client(tmp_path, monkeypatch):
+    monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-auth-test.db"))
+    monkeypatch.setenv("CONTROL_API_KEYS", "good-key,also-good")
+    from app.main import app  # noqa: WPS433
+    with TestClient(app) as c:
+        yield c
+
+
+def test_auth_disabled_allows_all(client):
+    r = client.post("/traces", json=_trace())
+    assert r.status_code == 201
+
+
+def test_auth_rejects_missing_key(auth_client):
+    r = auth_client.post("/traces", json=_trace())
+    assert r.status_code == 401
+
+
+def test_auth_rejects_invalid_key(auth_client):
+    r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": "wrong"})
+    assert r.status_code == 401
+
+
+def test_auth_accepts_valid_key(auth_client):
+    r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": "good-key"})
+    assert r.status_code == 201
+
+
+def test_auth_accepts_second_valid_key(auth_client):
+    r = auth_client.post("/traces", json=_trace(), headers={"X-Api-Key": "also-good"})
+    assert r.status_code == 201
+
+
+def test_health_always_accessible(auth_client):
+    r = auth_client.get("/health")
+    assert r.status_code == 200

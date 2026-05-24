@@ -1,9 +1,12 @@
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
+from .auth import verify_api_key
 from .db import init_db
 from .routes import components, shadow, traces
+
+_auth = [Depends(verify_api_key)]
 
 
 @asynccontextmanager
@@ -19,9 +22,9 @@ def create_app() -> FastAPI:
     def health() -> dict:
         return {"ok": True}
 
-    app.include_router(traces.router)
-    app.include_router(components.router)
-    app.include_router(shadow.router)
+    app.include_router(traces.router, dependencies=_auth)
+    app.include_router(components.router, dependencies=_auth)
+    app.include_router(shadow.router, dependencies=_auth)
     return app
 
 
