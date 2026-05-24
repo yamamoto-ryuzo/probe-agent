@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -21,6 +22,7 @@ class ProbeConfig:
     ENV_POLICY_TTL = "PROBE_POLICY_TTL"
     ENV_TIMEOUT = "PROBE_HTTP_TIMEOUT"
     ENV_SHUTDOWN_TIMEOUT = "PROBE_SHUTDOWN_TIMEOUT"
+    ENV_API_KEY = "PROBE_API_KEY"
 
     @classmethod
     def enabled(cls) -> bool:
@@ -55,3 +57,7 @@ class ProbeConfig:
             return float(os.getenv(cls.ENV_SHUTDOWN_TIMEOUT, "10"))
         except ValueError:
             return 10.0
+
+    @classmethod
+    def api_key(cls) -> Optional[str]:
+        return os.getenv(cls.ENV_API_KEY) or None

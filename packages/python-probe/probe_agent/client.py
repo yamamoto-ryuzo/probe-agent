@@ -21,12 +21,17 @@ class ControlClient:
         self._base_url = (base_url or ProbeConfig.server_url()).rstrip("/")
         self._timeout = timeout if timeout is not None else ProbeConfig.http_timeout()
 
+    def _headers(self) -> Dict[str, str]:
+        h: Dict[str, str] = {"Content-Type": "application/json"}
+        key = ProbeConfig.api_key()
+        if key:
+            h["X-Api-Key"] = key
+        return h
+
     def _post(self, path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         url = f"{self._base_url}{path}"
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
-        )
+        req = urllib.request.Request(url, data=data, headers=self._headers(), method="POST")
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read()
@@ -39,8 +44,9 @@ class ControlClient:
 
     def _get(self, path: str) -> Optional[Dict[str, Any]]:
         url = f"{self._base_url}{path}"
+        req = urllib.request.Request(url, headers=self._headers())
         try:
-            with urllib.request.urlopen(url, timeout=self._timeout) as resp:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read()
                 if not body:
                     return None
