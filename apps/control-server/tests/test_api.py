@@ -566,6 +566,194 @@ def test_cannot_delete_last_active_admin(admin_client):
     assert r.status_code == 409
 
 
+def test_logout_revokes_session_token(admin_client):
+    token = _login(admin_client)
+    r = admin_client.post("/auth/logout", headers=_bearer(token))
+    assert r.status_code == 204
+    r = admin_client.get("/auth/me", headers=_bearer(token))
+    assert r.status_code == 401
+
+
+def _create_user(client, admin_token, username="alice", password="pw", role="user"):
+    r = client.post(
+        "/users",
+        json={"username": username, "password": password, "role": role},
+        headers=_bearer(admin_token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
+
+
+def test_self_token_issue_list_and_revoke(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    # A non-admin user can issue their own API token.
+    r = admin_client.post(
+        "/tokens/me", json={"name": "my sdk token"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["user_id"] == uid
+    assert body["kind"] == "api"
+    raw = body["token"]
+    token_id = body["id"]
+
+    # The issued token authenticates SDK-style requests.
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 201
+
+    # The listing contains only the caller's tokens (session + api).
+    r = admin_client.get("/tokens/me", headers=_bearer(user_token))
+    assert r.status_code == 200
+    tokens = r.json()
+    assert {t["user_id"] for t in tokens} == {uid}
+    assert any(t["id"] == token_id for t in tokens)
+    # Raw token material is never included in listings.
+    assert all("token" not in t for t in tokens)
+
+    # The user can revoke their own token, after which it stops working.
+    r = admin_client.post(
+        f"/tokens/me/{token_id}/revoke", headers=_bearer(user_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["revoked"] is True
+    r = admin_client.post("/traces", json=_trace(), headers={"X-Api-Key": raw})
+    assert r.status_code == 401
+
+
+def test_self_token_cannot_revoke_others_token(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    r = admin_client.post(
+        "/tokens/me", json={"name": "admin token"}, headers=_bearer(admin_token)
+    )
+    admin_owned_id = r.json()["id"]
+
+    r = admin_client.post(
+        f"/tokens/me/{admin_owned_id}/revoke", headers=_bearer(user_token)
+    )
+    assert r.status_code == 404
+    # The admin's token is untouched.
+    r = admin_client.get("/tokens", headers=_bearer(admin_token))
+    target = next(t for t in r.json() if t["id"] == admin_owned_id)
+    assert target["revoked"] is False
+
+
+def test_self_token_endpoints_reject_legacy_key(auth_client):
+    r = auth_client.get("/tokens/me", headers={"X-Api-Key": "good-key"})
+    assert r.status_code == 403
+    r = auth_client.post(
+        "/tokens/me", json={"name": "x"}, headers={"X-Api-Key": "good-key"}
+    )
+    assert r.status_code == 403
+
+
+def test_self_token_endpoints_reject_anonymous(client):
+    # Auth disabled (no users, no legacy keys): there is no user account to
+    # attach a token to.
+    r = client.get("/tokens/me")
+    assert r.status_code == 403
+
+
+def test_admin_tokens_endpoints_reject_non_admin(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    assert admin_client.get("/tokens", headers=_bearer(user_token)).status_code == 403
+    r = admin_client.post(
+        "/tokens", json={"name": "x"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
+
+
+def test_admin_password_reset(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    old_session = _login(admin_client, "alice", "pw")
+    r = admin_client.post(
+        "/tokens/me", json={"name": "sdk"}, headers=_bearer(old_session)
+    )
+    api_raw = r.json()["token"]
+
+    r = admin_client.post(
+        f"/users/{uid}/password",
+        json={"password": "newpw"},
+        headers=_bearer(admin_token),
+    )
+    assert r.status_code == 200
+
+    # Old password no longer works; the new one does.
+    r = admin_client.post("/auth/login", json={"username": "alice", "password": "pw"})
+    assert r.status_code == 401
+    _login(admin_client, "alice", "newpw")
+
+    # Existing sessions are revoked, but API tokens keep working.
+    r = admin_client.get("/auth/me", headers=_bearer(old_session))
+    assert r.status_code == 401
+    r = admin_client.get("/auth/me", headers={"X-Api-Key": api_raw})
+    assert r.status_code == 200
+
+
+def test_password_reset_requires_admin_and_existing_user(admin_client):
+    admin_token = _login(admin_client)
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+
+    r = admin_client.post(
+        "/users/1/password", json={"password": "x"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
+    r = admin_client.post(
+        "/users/9999/password", json={"password": "x"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 404
+
+
+def test_admin_role_change(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 403
+
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "admin"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert r.json()["role"] == "admin"
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 200
+
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "user"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 200
+    assert admin_client.get("/users", headers=_bearer(user_token)).status_code == 403
+
+
+def test_cannot_demote_last_active_admin(admin_client):
+    admin_token = _login(admin_client)
+    me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()
+    root_id = me["user"]["id"]
+    r = admin_client.put(
+        f"/users/{root_id}/role", json={"role": "user"}, headers=_bearer(admin_token)
+    )
+    assert r.status_code == 409
+
+
+def test_role_change_requires_admin(admin_client):
+    admin_token = _login(admin_client)
+    uid = _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    r = admin_client.put(
+        f"/users/{uid}/role", json={"role": "admin"}, headers=_bearer(user_token)
+    )
+    assert r.status_code == 403
+
+
 def test_cannot_deactivate_last_active_admin(admin_client):
     admin_token = _login(admin_client)
     me = admin_client.get("/auth/me", headers=_bearer(admin_token)).json()

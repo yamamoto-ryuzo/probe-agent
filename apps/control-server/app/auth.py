@@ -109,3 +109,10 @@ async def require_admin(principal: Principal = Depends(get_principal)) -> Princi
     if not principal.is_admin:
         raise HTTPException(status_code=403, detail="Administrator privileges required")
     return principal
+
+
+async def require_user(principal: Principal = Depends(get_principal)) -> Principal:
+    """Require a caller backed by a user account (legacy keys/anonymous fail)."""
+    if principal.user_id is None:
+        raise HTTPException(status_code=403, detail="A user account is required")
+    return principal
