@@ -16,6 +16,8 @@ PROBE_SERVER_URL=http://localhost:8000 streamlit run app.py
 - `DASHBOARD_API_KEY`: service / fallback 用の API キー。
   設定すると（ログインしていない間）API リクエストに `X-Api-Key` ヘッダーを付与する。
 - `PROBE_API_KEY`: `DASHBOARD_API_KEY` 未設定時の fallback（SDK と共有）。
+- `DASHBOARD_COOKIE_SECURE`: `true` にするとログインCookieをHTTPS通信時だけ送信する。
+  HTTPSで公開する環境では有効にする。ローカルのHTTP開発環境では未設定にする。
 
 どちらのキーも未設定なら、従来どおり認証なしでアクセスする。
 
@@ -24,13 +26,20 @@ PROBE_SERVER_URL=http://localhost:8000 streamlit run app.py
 サイドバーの Login フォームから username / password でログインできる
 （Control Server の `/auth/login` を使用）。
 
-- 取得した session token は `st.session_state` にのみ保持する
-  （MVP では永続ログインなし。ブラウザの reload でセッションは消える）。
+- 取得した session token は `st.session_state` とブラウザCookieに保持する。
+  Cookieの有効期限はControl Serverが返すsession tokenの有効期限（現在は7日間）に合わせる。
+- ブラウザのreloadや新しいStreamlitセッションではCookieからsession tokenを復元する。
 - ログイン中は `Authorization: Bearer <session token>` が
   環境変数の API キーより優先される。
+- コンポーネント、トレース、設定画面はユーザーがログインしている場合だけ表示する。
+  `DASHBOARD_API_KEY`によるfallback認証だけではDashboardの内容を表示しない。
 - サイドバーに現在のユーザー名と role が表示される。
 - Logout で `/auth/logout` を呼び session token をサーバー側でも失効させ、
-  `st.session_state` から破棄する。
+  `st.session_state` とブラウザCookieから破棄する。
+- session tokenが期限切れ・失効済みの場合も、保存されたCookieを削除してLogin表示に戻る。
+
+Cookieはブラウザ側のJavaScriptから扱うため `HttpOnly` ではない。公開環境ではHTTPSを使用し、
+`DASHBOARD_COOKIE_SECURE=true` を設定する。
 
 ## Docker での起動
 

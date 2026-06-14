@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 import streamlit as st
+from streamlit_cookies_controller import CookieController, RemoveEmptyElementContainer
 
 
 def _maybe_pretty(text: Optional[str]) -> str:
@@ -48,6 +49,10 @@ SERVER_URL = os.getenv("PROBE_SERVER_URL", "http://localhost:8000").rstrip("/")
 # (falling back to ``PROBE_API_KEY``, shared with the SDK) is sent as
 # ``X-Api-Key``. With neither, requests are sent unauthenticated as before.
 ENV_API_KEY = os.getenv("DASHBOARD_API_KEY") or os.getenv("PROBE_API_KEY")
+SESSION_COOKIE_NAME = "probe_dashboard_session"
+SESSION_COOKIE_SECURE = os.getenv(
+    "DASHBOARD_COOKIE_SECURE", ""
+).strip().lower() in ("1", "true", "yes", "on")
 MODES = ["off", "trace", "shadow"]
 EVALUATIONS = ["unknown", "better", "worse", "same"]
 CRITERION_TYPES = [
@@ -64,6 +69,53 @@ ROLES = ["user", "admin"]
 
 def _session_token() -> Optional[str]:
     return st.session_state.get("session_token")
+
+
+def _restore_session_from_cookie() -> None:
+    if _session_token():
+        return
+    token = cookie_controller.get(SESSION_COOKIE_NAME)
+    if isinstance(token, str) and token:
+        st.session_state["session_token"] = token
+
+
+def _apply_pending_cookie_change() -> None:
+    change = st.session_state.pop("pending_session_cookie", None)
+    if not change:
+        return
+    if change["action"] == "set":
+        expires_at = change.get("expires_at")
+        expires = (
+            dt.datetime.fromtimestamp(expires_at)
+            if expires_at is not None
+            else dt.datetime.now() + dt.timedelta(days=7)
+        )
+        cookie_controller.set(
+            SESSION_COOKIE_NAME,
+            change["token"],
+            expires=expires,
+            secure=SESSION_COOKIE_SECURE,
+            same_site="strict",
+        )
+    elif cookie_controller.get(SESSION_COOKIE_NAME) is not None:
+        cookie_controller.remove(
+            SESSION_COOKIE_NAME,
+            secure=SESSION_COOKIE_SECURE,
+            same_site="strict",
+        )
+
+
+def _queue_session_cookie(token: str, expires_at: Optional[float]) -> None:
+    st.session_state["pending_session_cookie"] = {
+        "action": "set",
+        "token": token,
+        "expires_at": expires_at,
+    }
+
+
+def _clear_session_state_and_cookie() -> None:
+    st.session_state.pop("session_token", None)
+    st.session_state["pending_session_cookie"] = {"action": "remove"}
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -158,7 +210,10 @@ def _do_login(username: str, password: str) -> bool:
             pass
         st.error(f"login failed: {detail or r.status_code}")
         return False
-    st.session_state["session_token"] = r.json()["access_token"]
+    body = r.json()
+    token = body["access_token"]
+    st.session_state["session_token"] = token
+    _queue_session_cookie(token, body.get("expires_at"))
     return True
 
 
@@ -171,7 +226,7 @@ def _do_logout() -> None:
             )
         except requests.RequestException:
             pass
-    st.session_state.pop("session_token", None)
+    _clear_session_state_and_cookie()
     st.session_state.pop("issued_token", None)
 
 
@@ -195,8 +250,9 @@ def render_account_sidebar(me: Optional[Dict[str, Any]]) -> None:
     if _session_token():
         if user is None:
             # Session expired or revoked: drop it and fall through to the form.
-            st.session_state.pop("session_token", None)
-            st.sidebar.warning("セッションが無効になりました。再ログインしてください。")
+            _clear_session_state_and_cookie()
+            st.session_state["session_invalidated"] = True
+            st.rerun()
         else:
             st.sidebar.write(f"**{user['username']}** ({user['role']})")
             if st.sidebar.button("Logout"):
@@ -204,15 +260,10 @@ def render_account_sidebar(me: Optional[Dict[str, Any]]) -> None:
                 st.rerun()
             return
 
-    if user is not None:
-        # Authenticated via env API key bound to a user account.
-        st.sidebar.caption(
-            f"環境変数の API key で **{user['username']}** ({user['role']}) として認証中"
-        )
-    elif me is not None and me.get("auth") == "legacy_api_key":
-        st.sidebar.caption("legacy API key で認証中（ユーザーなし）")
-    elif me is not None and me.get("auth") == "anonymous":
-        st.sidebar.caption("認証なしモード（ユーザー未登録）")
+    st.sidebar.caption("未ログイン")
+
+    if st.session_state.pop("session_invalidated", False):
+        st.sidebar.warning("セッションが無効になりました。再ログインしてください。")
 
     with st.sidebar.form("login-form"):
         st.markdown("**Login**")
@@ -666,6 +717,10 @@ def render_components_tab() -> None:
 # --- Page layout -------------------------------------------------------------
 
 st.set_page_config(page_title="probe-agent", layout="wide")
+cookie_controller = CookieController(key="probe-dashboard-cookies")
+RemoveEmptyElementContainer()
+_apply_pending_cookie_change()
+_restore_session_from_cookie()
 st.title("probe-agent dashboard")
 st.caption(f"Control Server: {SERVER_URL}")
 
@@ -675,6 +730,11 @@ render_account_sidebar(me)
 if _session_token() is None and me is None:
     me = _fetch_me()
 user = (me or {}).get("user")
+
+if _session_token() is None or user is None:
+    st.info("コンポーネントを表示するにはログインしてください。")
+    st.stop()
+
 is_admin = bool(user) and user.get("role") == "admin"
 
 tab_labels = ["Components"]
