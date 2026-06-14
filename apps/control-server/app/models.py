@@ -184,6 +184,21 @@ class TokenCreate(BaseModel):
     expires_in_days: Optional[int] = Field(default=None, ge=1)
 
 
+class SelfTokenCreate(BaseModel):
+    """Token issuance for the caller's own account (no user_id override)."""
+
+    name: Optional[str] = None
+    expires_in_days: Optional[int] = Field(default=None, ge=1)
+
+
+class PasswordResetRequest(BaseModel):
+    password: str = Field(..., min_length=1)
+
+
+class RoleUpdate(BaseModel):
+    role: Role
+
+
 class TokenOut(BaseModel):
     id: int
     name: Optional[str] = None
