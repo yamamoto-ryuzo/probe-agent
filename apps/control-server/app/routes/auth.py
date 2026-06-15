@@ -42,23 +42,33 @@ def _token_out(row) -> TokenOut:
         name=row["name"],
         kind=row["kind"],
         user_id=row["user_id"],
+        system_id=row["system_id"],
         revoked=bool(row["revoked"]),
         created_at=row["created_at"],
         expires_at=row["expires_at"],
     )
 
 
-_TOKEN_COLUMNS = "id, name, kind, user_id, revoked, created_at, expires_at"
+_TOKEN_COLUMNS = "id, name, kind, user_id, system_id, revoked, created_at, expires_at"
 
 
-def _issue_token(conn, *, user_id: int, kind: str, name: Optional[str], expires_at: Optional[float]) -> str:
+def _issue_token(
+    conn,
+    *,
+    user_id: int,
+    kind: str,
+    name: Optional[str],
+    expires_at: Optional[float],
+    system_id: Optional[int] = None,
+) -> str:
     raw = generate_token()
     conn.execute(
         """
-        INSERT INTO api_tokens (token_hash, name, kind, user_id, revoked, created_at, expires_at)
-        VALUES (?, ?, ?, ?, 0, ?, ?)
+        INSERT INTO api_tokens
+            (token_hash, name, kind, user_id, system_id, revoked, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
         """,
-        (hash_token(raw), name, kind, user_id, time.time(), expires_at),
+        (hash_token(raw), name, kind, user_id, system_id, time.time(), expires_at),
     )
     return raw
 
@@ -76,7 +86,11 @@ def login(payload: LoginRequest) -> TokenResponse:
             raise HTTPException(status_code=403, detail="User is deactivated")
         expires_at = time.time() + _SESSION_TTL_SECONDS
         raw = _issue_token(
-            conn, user_id=row["id"], kind="session", name="login session", expires_at=expires_at
+            conn,
+            user_id=row["id"],
+            kind="session",
+            name="login session",
+            expires_at=expires_at,
         )
     return TokenResponse(access_token=raw, expires_at=expires_at)
 
@@ -96,7 +110,7 @@ def logout(principal: Principal = Depends(get_principal)) -> Response:
 @router.get("/auth/me", response_model=MeResponse)
 def me(principal: Principal = Depends(get_principal)) -> MeResponse:
     if principal.user_id is None:
-        return MeResponse(user=None, auth=principal.auth)
+        return MeResponse(user=None, auth=principal.auth, system_id=principal.system_id)
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id, username, role, is_active, created_at FROM users WHERE id = ?",
@@ -104,7 +118,49 @@ def me(principal: Principal = Depends(get_principal)) -> MeResponse:
         ).fetchone()
     if row is None:
         raise HTTPException(status_code=404, detail="User not found")
-    return MeResponse(user=_user_out(row), auth=principal.auth)
+    return MeResponse(
+        user=_user_out(row), auth=principal.auth, system_id=principal.system_id
+    )
+
+
+def _resolve_token_system(
+    conn, principal: Principal, requested_system_id: Optional[int]
+) -> int:
+    if requested_system_id is None:
+        if principal.is_admin:
+            row = conn.execute(
+                """
+                SELECT id FROM systems
+                WHERE name = 'Legacy System' AND owner_user_id IS NULL
+                """
+            ).fetchone()
+            if row is not None:
+                return row["id"]
+        row = conn.execute(
+            "SELECT id FROM systems WHERE owner_user_id = ? ORDER BY id LIMIT 1",
+            (principal.user_id,),
+        ).fetchone()
+        if row is not None:
+            return row["id"]
+        now = time.time()
+        cur = conn.execute(
+            """
+            INSERT INTO systems
+                (name, environment, description, owner_user_id, created_at, updated_at)
+            VALUES ('Default System', '', '', ?, ?, ?)
+            """,
+            (principal.user_id, now, now),
+        )
+        return cur.lastrowid
+
+    row = conn.execute(
+        "SELECT owner_user_id FROM systems WHERE id = ?", (requested_system_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="System not found")
+    if not principal.is_admin and row["owner_user_id"] != principal.user_id:
+        raise HTTPException(status_code=403, detail="System access denied")
+    return requested_system_id
 
 
 @router.get("/users", response_model=List[UserOut])
@@ -265,12 +321,14 @@ def create_my_token(
         expires_at = time.time() + payload.expires_in_days * 24 * 3600
 
     with get_conn() as conn:
+        system_id = _resolve_token_system(conn, principal, payload.system_id)
         raw = _issue_token(
             conn,
             user_id=principal.user_id,
             kind="api",
             name=payload.name,
             expires_at=expires_at,
+            system_id=system_id,
         )
         row = conn.execute(
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens WHERE token_hash = ?",
@@ -325,8 +383,19 @@ def create_token(
         ).fetchone()
         if owner is None:
             raise HTTPException(status_code=404, detail="Token owner not found or inactive")
+        system_principal = Principal(
+            auth=admin.auth,
+            user_id=owner_id,
+            role=admin.role,
+        )
+        system_id = _resolve_token_system(conn, system_principal, payload.system_id)
         raw = _issue_token(
-            conn, user_id=owner_id, kind="api", name=payload.name, expires_at=expires_at
+            conn,
+            user_id=owner_id,
+            kind="api",
+            name=payload.name,
+            expires_at=expires_at,
+            system_id=system_id,
         )
         row = conn.execute(
             f"SELECT {_TOKEN_COLUMNS} FROM api_tokens WHERE token_hash = ?",

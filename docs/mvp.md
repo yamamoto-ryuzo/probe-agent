@@ -44,11 +44,15 @@ issue #1 で定義された MVP の実装メモ。
 component の出力を、システム全体の目的・component の責務・評価基準に紐づけて
 評価できるようにする。LLM 評価は使わず、決定的なルールのみで判定する。
 
-3 階層のデータモデル:
+4 階層のデータモデル:
 
-- **System Profile**: システムの目的・対象ユーザー・提供価値・制約（シングルトン）
+- **System**: API token が接続する独立した対象システム
+- **System Profile**: System ごとの目的・対象ユーザー・提供価値・制約
 - **Component Profile**: component ごとの責務・入出力期待・失敗時の影響
 - **Evaluation Criteria / Results**: component ごとの評価観点と、trace 単位の評価結果
+
+同じ `component_id` や `trace_id` が異なる System に存在しても、policy、
+trace、shadow result、profile、評価結果は混在しない。
 
 API:
 

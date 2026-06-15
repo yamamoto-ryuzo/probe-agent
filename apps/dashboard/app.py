@@ -44,6 +44,11 @@ def _unified_diff(current: Optional[str], candidate: Optional[str]) -> str:
     )
 
 SERVER_URL = os.getenv("PROBE_SERVER_URL", "http://localhost:8000").rstrip("/")
+CLIENT_SERVER_URL = os.getenv("PROBE_CLIENT_SERVER_URL", "").strip().rstrip("/")
+SDK_INSTALL_URL = os.getenv(
+    "PROBE_SDK_INSTALL_URL",
+    "git+https://github.com/dx-junkyard/probe-agent.git@main#subdirectory=packages/python-probe",
+)
 # Service/fallback credential. A browser login session (kept in
 # ``st.session_state``) takes precedence; without one, ``DASHBOARD_API_KEY``
 # (falling back to ``PROBE_API_KEY``, shared with the SDK) is sent as
@@ -115,13 +120,19 @@ def _queue_session_cookie(token: str, expires_at: Optional[float]) -> None:
 
 def _clear_session_state_and_cookie() -> None:
     st.session_state.pop("session_token", None)
+    st.session_state.pop("selected_system_id", None)
+    st.session_state.pop("system_selector", None)
     st.session_state["pending_session_cookie"] = {"action": "remove"}
 
 
 def _auth_headers() -> Dict[str, str]:
     token = _session_token()
     if token:
-        return {"Authorization": f"Bearer {token}"}
+        headers = {"Authorization": f"Bearer {token}"}
+        system_id = st.session_state.get("selected_system_id")
+        if system_id is not None:
+            headers["X-Probe-System-Id"] = str(system_id)
+        return headers
     if ENV_API_KEY:
         return {"X-Api-Key": ENV_API_KEY}
     return {}
@@ -240,6 +251,93 @@ def fmt_ts(ts: Optional[float]) -> str:
     return dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _client_server_url() -> str:
+    if CLIENT_SERVER_URL:
+        return CLIENT_SERVER_URL
+    if SERVER_URL in ("http://control-server:8000", "https://control-server:8000"):
+        return SERVER_URL.replace("control-server", "localhost")
+    return SERVER_URL
+
+
+def _current_or_placeholder_token() -> str:
+    issued = st.session_state.get("issued_token")
+    if issued and issued.get("token"):
+        return issued["token"]
+    return "<issued-api-token>"
+
+
+def _probe_env_text() -> str:
+    return "\n".join(
+        [
+            "PROBE_ENABLED=true",
+            f"PROBE_SERVER_URL={_client_server_url()}",
+            f"PROBE_API_KEY={_current_or_placeholder_token()}",
+            "PROBE_DEFAULT_MODE=trace",
+            "",
+        ]
+    )
+
+
+def _sample_probe_source() -> str:
+    return '''"""Minimal probe-agent client sample.
+
+Run:
+    python sample_probe_client.py
+"""
+
+from probe_agent import flush, probe, set_candidate
+
+
+def summarize_v2(text: str) -> str:
+    """Candidate implementation used when the component is in shadow mode."""
+    return text.split(".")[0].strip()
+
+
+set_candidate("summarizer", summarize_v2)
+
+
+@probe(component_id="summarizer")
+def summarize(text: str) -> str:
+    return text[:80]
+
+
+@probe(component_id="classifier")
+def classify(text: str) -> str:
+    return "long" if len(text) > 80 else "short"
+
+
+if __name__ == "__main__":
+    text = (
+        "probe-agent records component inputs and outputs. "
+        "Shadow mode compares a candidate implementation safely."
+    )
+    print("summary:", summarize(text))
+    print("class:", classify(text))
+    flush()
+'''
+
+
+def _sample_dockerfile() -> str:
+    return f"""FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends git \\
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install "{SDK_INSTALL_URL}"
+
+COPY sample_probe_client.py /app/sample_probe_client.py
+
+ENV PROBE_ENABLED=true
+ENV PROBE_SERVER_URL={_client_server_url()}
+ENV PROBE_API_KEY=<issued-api-token>
+
+CMD ["python", "sample_probe_client.py"]
+"""
+
+
 # --- Sidebar: account / login ----------------------------------------------
 
 
@@ -274,34 +372,40 @@ def render_account_sidebar(me: Optional[Dict[str, Any]]) -> None:
                 st.rerun()
 
 
-# --- My Tokens tab ----------------------------------------------------------
+# --- SDK connection tab -----------------------------------------------------
 
 
-def render_my_tokens_tab(user: Dict[str, Any]) -> None:
-    st.subheader("My Tokens")
+def render_access_tokens(system: Dict[str, Any], *, compact: bool = False) -> None:
+    st.subheader("Access Tokens")
     st.caption(
-        "SDK / API 用の token を自分で発行・失効できます。"
+        f"このtokenで送信されたプローブは「{system['name']}」に記録されます。"
         "raw token は発行直後にしか表示されません。"
     )
 
     issued = st.session_state.get("issued_token")
     if issued:
-        st.success("token を発行しました。raw token は今だけ表示されます。控えてください。")
+        st.success(
+            f"{system['name']}用のtokenを発行しました。"
+            "raw token は今だけ表示されます。"
+        )
         st.code(issued["token"])
-        st.markdown("SDK / Dashboard 設定用 snippet:")
-        st.code(f"PROBE_API_KEY={issued['token']}", language="bash")
+        st.markdown("クライアント設定用 snippet:")
+        st.code(_probe_env_text(), language="bash")
         if st.button("表示を閉じる（以後表示されません）"):
             st.session_state.pop("issued_token", None)
             st.rerun()
 
-    with st.form("issue-token-form"):
+    with st.form(f"issue-token-form-{system['id']}"):
         st.markdown("**新しい API token を発行**")
-        name = st.text_input("name（用途のメモ、任意）")
+        name = st.text_input("name（例: production、staging）")
         days = st.number_input(
             "expires_in_days（0 = 無期限）", min_value=0, value=0, step=1
         )
         if st.form_submit_button("Issue token"):
-            payload: Dict[str, Any] = {"name": name.strip() or None}
+            payload: Dict[str, Any] = {
+                "name": name.strip() or None,
+                "system_id": system["id"],
+            }
             if days:
                 payload["expires_in_days"] = int(days)
             res = api_post("/tokens/me", payload)
@@ -310,9 +414,17 @@ def render_my_tokens_tab(user: Dict[str, Any]) -> None:
                 st.rerun()
 
     st.markdown("#### 自分の token 一覧")
-    tokens: List[Dict[str, Any]] = api_get("/tokens/me") or []
+    tokens: List[Dict[str, Any]] = [
+        token
+        for token in (api_get("/tokens/me") or [])
+        if token.get("kind") == "api" and token.get("system_id") == system["id"]
+    ]
     if not tokens:
         st.write("token なし")
+        return
+    if compact:
+        active_count = sum(1 for t in tokens if not t["revoked"])
+        st.caption(f"このSystemのAPI token: {len(tokens)}件（active {active_count}件）")
         return
     header = st.columns([1, 3, 2, 2, 3, 3, 2])
     for col, label in zip(
@@ -333,6 +445,72 @@ def render_my_tokens_tab(user: Dict[str, Any]) -> None:
                     if api_post(f"/tokens/me/{t['id']}/revoke") is not None:
                         st.success(f"token #{t['id']} を失効しました")
                         st.rerun()
+
+
+def render_connect_sdk_tab(system: Dict[str, Any]) -> None:
+    st.subheader("Connect SDK")
+    st.caption(
+        f"選択中System「{system['name']}」へ、クライアント側のプローブを接続します。"
+    )
+
+    st.markdown("### 1. API tokenを発行")
+    render_access_tokens(system, compact=True)
+
+    st.divider()
+    st.markdown("### 2. SDKをインストール")
+    st.write(
+        "現状はpackage registryへpublishしていないため、Git URLから"
+        "`packages/python-probe`だけをインストールします。"
+    )
+    st.code(f'pip install "{SDK_INSTALL_URL}"', language="bash")
+
+    st.markdown("ローカルでこのリポジトリをチェックアウト済みの場合:")
+    st.code("pip install -e packages/python-probe", language="bash")
+
+    st.divider()
+    st.markdown("### 3. クライアント環境変数")
+    st.write(
+        "`PROBE_API_KEY`には、このタブで発行したraw tokenを設定します。"
+        "raw tokenは発行直後にしか表示されません。"
+    )
+    st.code(_probe_env_text(), language="bash")
+    st.download_button(
+        "Download .env.sample",
+        data=_probe_env_text(),
+        file_name=f"probe-agent-{system['id']}.env.sample",
+        mime="text/plain",
+    )
+
+    st.divider()
+    st.markdown("### 4. サンプルソースコード")
+    st.write(
+        "`@probe(component_id=...)`を対象関数に付けるだけで、入出力、エラー、"
+        "実行時間がこのSystemへ送信されます。`set_candidate`を使うと、"
+        "Dashboardでmodeを`shadow`へ切り替えたときに候補実装との比較ができます。"
+    )
+    sample_source = _sample_probe_source()
+    st.code(sample_source, language="python")
+    sample_cols = st.columns(2)
+    with sample_cols[0]:
+        st.download_button(
+            "Download sample_probe_client.py",
+            data=sample_source,
+            file_name="sample_probe_client.py",
+            mime="text/x-python",
+        )
+    with sample_cols[1]:
+        st.download_button(
+            "Download Dockerfile.sample",
+            data=_sample_dockerfile(),
+            file_name="Dockerfile.probe-sample",
+            mime="text/plain",
+        )
+
+    st.markdown("実行例:")
+    st.code(
+        "source probe-agent-<system-id>.env.sample\npython sample_probe_client.py",
+        language="bash",
+    )
 
 
 # --- Admin: User Management tab ----------------------------------------------
@@ -428,22 +606,28 @@ def render_admin_tab(me_user: Dict[str, Any]) -> None:
     if not tokens:
         st.write("token なし")
         return
-    header = st.columns([1, 3, 2, 3, 2, 3, 3, 2])
+    systems: List[Dict[str, Any]] = api_get("/systems") or []
+    system_names = {s["id"]: s["name"] for s in systems}
+    header = st.columns([1, 3, 2, 3, 3, 2, 3, 3, 2])
     for col, label in zip(
         header,
-        ["id", "name", "kind", "user", "status", "created_at", "expires_at", "操作"],
+        [
+            "id", "name", "kind", "user", "system", "status",
+            "created_at", "expires_at", "操作",
+        ],
     ):
         col.markdown(f"**{label}**")
     for t in tokens:
-        c = st.columns([1, 3, 2, 3, 2, 3, 3, 2])
+        c = st.columns([1, 3, 2, 3, 3, 2, 3, 3, 2])
         c[0].write(t["id"])
         c[1].write(t.get("name") or "-")
         c[2].write(t["kind"])
         c[3].write(f"#{t['user_id']} {usernames.get(t['user_id'], '?')}")
-        c[4].write("revoked" if t["revoked"] else "active")
-        c[5].write(fmt_ts(t["created_at"]))
-        c[6].write(fmt_ts(t.get("expires_at")))
-        with c[7]:
+        c[4].write(system_names.get(t.get("system_id"), "-"))
+        c[5].write("revoked" if t["revoked"] else "active")
+        c[6].write(fmt_ts(t["created_at"]))
+        c[7].write(fmt_ts(t.get("expires_at")))
+        with c[8]:
             if not t["revoked"]:
                 if st.button("Revoke", key=f"adm-revoke-{t['id']}"):
                     if api_post(f"/tokens/{t['id']}/revoke") is not None:
@@ -454,38 +638,7 @@ def render_admin_tab(me_user: Dict[str, Any]) -> None:
 # --- Components tab ----------------------------------------------------------
 
 
-def render_components_tab() -> None:
-    # --- System profile ---------------------------------------------------
-    with st.expander("System Profile（システム全体の目的・価値・制約）"):
-        sp = api_get("/system-profile") or {}
-        with st.form("system-profile-form"):
-            sp_name = st.text_input("name", value=sp.get("name", ""))
-            sp_purpose = st.text_area("purpose", value=sp.get("purpose", ""))
-            sp_users = st.text_area(
-                "target_users (1行1項目)", value="\n".join(sp.get("target_users", []))
-            )
-            sp_value = st.text_area("stakeholder_value", value=sp.get("stakeholder_value", ""))
-            sp_constraints = st.text_area(
-                "constraints (1行1項目)", value="\n".join(sp.get("constraints", []))
-            )
-            sp_success = st.text_area(
-                "success_criteria (1行1項目)", value="\n".join(sp.get("success_criteria", []))
-            )
-            if st.form_submit_button("Save system profile"):
-                api_put(
-                    "/system-profile",
-                    {
-                        "name": sp_name,
-                        "purpose": sp_purpose,
-                        "target_users": _lines_to_list(sp_users),
-                        "stakeholder_value": sp_value,
-                        "constraints": _lines_to_list(sp_constraints),
-                        "success_criteria": _lines_to_list(sp_success),
-                    },
-                )
-                st.success("system profile を保存しました")
-                st.rerun()
-
+def render_components_tab(system: Dict[str, Any]) -> None:
     components: List[Dict[str, Any]] = api_get("/components") or []
     if not components:
         st.info("まだ component がありません。`@probe` を付けた関数を実行してください。")
@@ -519,9 +672,9 @@ def render_components_tab() -> None:
         key=f"mode-{selected}",
     )
     if new_mode != current_mode:
-        if st.button(f"Switch to {new_mode}"):
+        if st.button(f"Switch {system['name']} / {selected} to {new_mode}"):
             api_put(f"/components/{selected}/policy", {"mode": new_mode})
-            st.success(f"mode を {new_mode} に変更しました")
+            st.success(f"{system['name']} / {selected} を {new_mode} に変更しました")
             st.rerun()
 
     st.divider()
@@ -714,6 +867,160 @@ def render_components_tab() -> None:
                 st.caption(f"trace_id: {s['trace_id']}")
 
 
+def render_overview_tab(system: Dict[str, Any]) -> None:
+    components: List[Dict[str, Any]] = api_get("/components") or []
+    mode_counts = {mode: 0 for mode in MODES}
+    for component in components:
+        mode = component.get("mode")
+        if mode in mode_counts:
+            mode_counts[mode] += 1
+
+    cols = st.columns(4)
+    cols[0].metric("Components", system.get("component_count", 0))
+    cols[1].metric("Traces", system.get("trace_count", 0))
+    cols[2].metric("Last seen", fmt_ts(system.get("last_seen")))
+    cols[3].metric(
+        "Active modes",
+        f"trace {mode_counts['trace']} / shadow {mode_counts['shadow']}",
+    )
+
+    st.subheader("System")
+    st.write(system.get("description") or "説明はまだ設定されていません。")
+    if system.get("last_seen") is None:
+        st.info(
+            "まだプローブからデータを受信していません。Connect SDKでAPI tokenを発行し、"
+            "クライアント側の`PROBE_API_KEY`へ設定してください。"
+        )
+
+    st.subheader("Components")
+    if not components:
+        st.write("component なし")
+        return
+    for component in components:
+        st.write(
+            f"**{component['component_id']}** · `{component['mode']}` · "
+            f"{component.get('trace_count', 0)} traces · "
+            f"last seen {fmt_ts(component.get('last_seen'))}"
+        )
+
+
+def render_system_settings(system: Dict[str, Any]) -> None:
+    st.subheader("System Settings")
+    with st.form(f"system-settings-{system['id']}"):
+        name = st.text_input("System name", value=system.get("name", ""))
+        environment = st.text_input(
+            "Environment", value=system.get("environment", "")
+        )
+        description = st.text_area(
+            "Description", value=system.get("description", "")
+        )
+        if st.form_submit_button("Save system settings"):
+            if not name.strip():
+                st.error("System name は必須です")
+            elif api_put(
+                f"/systems/{system['id']}",
+                {
+                    "name": name.strip(),
+                    "environment": environment.strip(),
+                    "description": description,
+                },
+            ) is not None:
+                st.success("System設定を保存しました")
+                st.rerun()
+
+    st.divider()
+    st.subheader("System Profile")
+    sp = api_get("/system-profile") or {}
+    with st.form(f"system-profile-form-{system['id']}"):
+        sp_name = st.text_input("name", value=sp.get("name", ""))
+        sp_purpose = st.text_area("purpose", value=sp.get("purpose", ""))
+        sp_users = st.text_area(
+            "target_users (1行1項目)", value="\n".join(sp.get("target_users", []))
+        )
+        sp_value = st.text_area(
+            "stakeholder_value", value=sp.get("stakeholder_value", "")
+        )
+        sp_constraints = st.text_area(
+            "constraints (1行1項目)", value="\n".join(sp.get("constraints", []))
+        )
+        sp_success = st.text_area(
+            "success_criteria (1行1項目)",
+            value="\n".join(sp.get("success_criteria", [])),
+        )
+        if st.form_submit_button("Save system profile"):
+            api_put(
+                "/system-profile",
+                {
+                    "name": sp_name,
+                    "purpose": sp_purpose,
+                    "target_users": _lines_to_list(sp_users),
+                    "stakeholder_value": sp_value,
+                    "constraints": _lines_to_list(sp_constraints),
+                    "success_criteria": _lines_to_list(sp_success),
+                },
+            )
+            st.success("System Profileを保存しました")
+            st.rerun()
+
+
+def render_system_selector(
+    systems: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    st.sidebar.markdown("### System")
+    if not systems:
+        st.sidebar.info("Systemを作成してください")
+        return None
+
+    ids = [system["id"] for system in systems]
+    pending_id = st.session_state.pop("pending_system_id", None)
+    selected_id = pending_id or st.session_state.get("selected_system_id")
+    if selected_id not in ids:
+        selected_id = ids[0]
+    if pending_id is not None or st.session_state.get("system_selector") not in ids:
+        st.session_state["system_selector"] = selected_id
+    selected_id = st.sidebar.selectbox(
+        "Current system",
+        ids,
+        index=ids.index(selected_id),
+        key="system_selector",
+        format_func=lambda system_id: next(
+            (
+                f"{s['name']} / {s.get('environment') or 'default'}"
+                for s in systems
+                if s["id"] == system_id
+            ),
+            str(system_id),
+        ),
+    )
+    if selected_id != st.session_state.get("selected_system_id"):
+        st.session_state.pop("issued_token", None)
+    st.session_state["selected_system_id"] = selected_id
+    return next(system for system in systems if system["id"] == selected_id)
+
+
+def render_create_system() -> None:
+    with st.sidebar.expander("新しいSystemを登録"):
+        with st.form("create-system-form"):
+            name = st.text_input("System name")
+            environment = st.text_input("Environment", placeholder="production")
+            description = st.text_area("Description")
+            if st.form_submit_button("Create system"):
+                if not name.strip():
+                    st.error("System name は必須です")
+                else:
+                    created = api_post(
+                        "/systems",
+                        {
+                            "name": name.strip(),
+                            "environment": environment.strip(),
+                            "description": description,
+                        },
+                    )
+                    if created:
+                        st.session_state["pending_system_id"] = created["id"]
+                        st.rerun()
+
+
 # --- Page layout -------------------------------------------------------------
 
 st.set_page_config(page_title="probe-agent", layout="wide")
@@ -737,18 +1044,34 @@ if _session_token() is None or user is None:
 
 is_admin = bool(user) and user.get("role") == "admin"
 
-tab_labels = ["Components"]
-if user:
-    tab_labels.append("My Tokens")
+systems: List[Dict[str, Any]] = api_get("/systems") or []
+selected_system = render_system_selector(systems)
+render_create_system()
+
+if selected_system is None:
+    st.info("左側の「新しいSystemを登録」から最初のSystemを作成してください。")
+    st.stop()
+
+environment = selected_system.get("environment") or "default"
+st.header(f"{selected_system['name']} / {environment}")
+st.caption(
+    f"System ID: {selected_system['id']} · "
+    f"Last seen: {fmt_ts(selected_system.get('last_seen'))}"
+)
+
+tab_labels = ["Overview", "Connect SDK", "Components", "Settings"]
 if is_admin:
     tab_labels.append("User Management")
 tabs = st.tabs(tab_labels)
 
 with tabs[0]:
-    render_components_tab()
-if user:
-    with tabs[tab_labels.index("My Tokens")]:
-        render_my_tokens_tab(user)
+    render_overview_tab(selected_system)
+with tabs[1]:
+    render_connect_sdk_tab(selected_system)
+with tabs[2]:
+    render_components_tab(selected_system)
+with tabs[3]:
+    render_system_settings(selected_system)
 if is_admin:
     with tabs[tab_labels.index("User Management")]:
         render_admin_tab(user)

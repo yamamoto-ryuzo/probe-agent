@@ -228,6 +228,10 @@ def summarize(text: str) -> str:
     return text[:80]
 ```
 
+Dashboard の `Connect SDK` タブでは、選択中 System 用の API token 発行、
+SDK install command、クライアント環境変数、最小サンプルソース、
+Dockerfile サンプルをまとめて確認・ダウンロードできる。
+
 ## 認証と Dashboard のログイン方式
 
 現状の Dashboard にはブラウザ上のログイン画面はない。Dashboard は起動時に
@@ -310,6 +314,8 @@ Docker Compose はリポジトリルートの `.env` を読み込む。ローカ
 | `PROBE_API_KEY` | _(未設定)_ | SDK が送る API キー (`X-Api-Key` ヘッダー) |
 | `CONTROL_API_KEYS` | _(未設定)_ | Control Server が受け付ける API キー（カンマ区切り複数可）。未設定時は認証なし |
 | `DASHBOARD_API_KEY` | _(未設定)_ | Dashboard が Control Server に送る API キー |
+| `PROBE_CLIENT_SERVER_URL` | _(未設定)_ | Dashboard の `Connect SDK` タブに表示するクライアント向け Control Server URL |
+| `PROBE_SDK_INSTALL_URL` | GitHub の `packages/python-probe` | Dashboard の `Connect SDK` タブに表示する SDK install URL |
 | `CONTROL_ADMIN_USERNAME` | _(未設定)_ | 起動時に作成する初期管理者ユーザー名 |
 | `CONTROL_ADMIN_PASSWORD` | _(未設定)_ | 起動時に作成する初期管理者パスワード |
 

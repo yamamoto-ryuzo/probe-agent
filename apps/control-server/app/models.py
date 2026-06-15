@@ -77,6 +77,31 @@ class SystemProfileUpdate(BaseModel):
     success_criteria: List[str] = Field(default_factory=list)
 
 
+class SystemCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    environment: str = ""
+    description: str = ""
+
+
+class SystemUpdate(BaseModel):
+    name: str = Field(..., min_length=1)
+    environment: str = ""
+    description: str = ""
+
+
+class SystemOut(BaseModel):
+    id: int
+    name: str
+    environment: str = ""
+    description: str = ""
+    owner_user_id: Optional[int] = None
+    created_at: float
+    updated_at: float
+    component_count: int = 0
+    trace_count: int = 0
+    last_seen: Optional[float] = None
+
+
 class ComponentProfile(BaseModel):
     component_id: str
     purpose: str = ""
@@ -174,10 +199,12 @@ class UserOut(BaseModel):
 class MeResponse(BaseModel):
     user: Optional[UserOut] = None
     auth: str = Field(..., description="token | legacy_api_key | anonymous")
+    system_id: Optional[int] = None
 
 
 class TokenCreate(BaseModel):
     name: Optional[str] = None
+    system_id: Optional[int] = None
     user_id: Optional[int] = Field(
         default=None, description="owner of the token; defaults to the caller"
     )
@@ -188,6 +215,7 @@ class SelfTokenCreate(BaseModel):
     """Token issuance for the caller's own account (no user_id override)."""
 
     name: Optional[str] = None
+    system_id: Optional[int] = None
     expires_in_days: Optional[int] = Field(default=None, ge=1)
 
 
@@ -204,6 +232,7 @@ class TokenOut(BaseModel):
     name: Optional[str] = None
     kind: TokenKind
     user_id: int
+    system_id: Optional[int] = None
     revoked: bool
     created_at: float
     expires_at: Optional[float] = None

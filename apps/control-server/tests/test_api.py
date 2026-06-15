@@ -456,6 +456,138 @@ def test_token_issue_use_and_revoke(admin_client):
     assert r.status_code == 401
 
 
+def _create_system(client, token, name, environment="production"):
+    r = client.post(
+        "/systems",
+        json={
+            "name": name,
+            "environment": environment,
+            "description": f"{name} description",
+        },
+        headers=_bearer(token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _issue_system_token(client, login_token, system_id, name):
+    r = client.post(
+        "/tokens/me",
+        json={"name": name, "system_id": system_id},
+        headers=_bearer(login_token),
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_system_tokens_isolate_components_traces_and_policy(admin_client):
+    admin_token = _login(admin_client)
+    system_a = _create_system(admin_client, admin_token, "Support API")
+    system_b = _create_system(admin_client, admin_token, "Document Pipeline")
+    token_a = _issue_system_token(
+        admin_client, admin_token, system_a["id"], "support-production"
+    )
+    token_b = _issue_system_token(
+        admin_client, admin_token, system_b["id"], "documents-production"
+    )
+
+    # The same component and trace ids are valid in separate systems.
+    r = admin_client.post(
+        "/traces",
+        json=_trace(component_id="shared", trace_id="same-trace"),
+        headers={"X-Api-Key": token_a["token"]},
+    )
+    assert r.status_code == 201
+    trace_b = _trace(component_id="shared", trace_id="same-trace")
+    trace_b["output"] = "'SYSTEM_B'"
+    r = admin_client.post(
+        "/traces", json=trace_b, headers={"X-Api-Key": token_b["token"]}
+    )
+    assert r.status_code == 201
+
+    r = admin_client.put(
+        "/components/shared/policy",
+        json={"mode": "shadow"},
+        headers={"X-Api-Key": token_a["token"]},
+    )
+    assert r.status_code == 200
+
+    policy_a = admin_client.get(
+        "/components/shared/policy", headers={"X-Api-Key": token_a["token"]}
+    ).json()
+    policy_b = admin_client.get(
+        "/components/shared/policy", headers={"X-Api-Key": token_b["token"]}
+    ).json()
+    assert policy_a["mode"] == "shadow"
+    assert policy_b["mode"] == "trace"
+
+    rows_a = admin_client.get(
+        "/components/shared/traces", headers={"X-Api-Key": token_a["token"]}
+    ).json()
+    rows_b = admin_client.get(
+        "/components/shared/traces", headers={"X-Api-Key": token_b["token"]}
+    ).json()
+    assert rows_a[0]["output"] == "'HI'"
+    assert rows_b[0]["output"] == "'SYSTEM_B'"
+
+    systems = admin_client.get("/systems", headers=_bearer(admin_token)).json()
+    summaries = {system["id"]: system for system in systems}
+    assert summaries[system_a["id"]]["trace_count"] == 1
+    assert summaries[system_b["id"]]["trace_count"] == 1
+
+
+def test_user_cannot_select_or_issue_token_for_another_users_system(admin_client):
+    admin_token = _login(admin_client)
+    admin_system = _create_system(admin_client, admin_token, "Admin System")
+    _create_user(admin_client, admin_token)
+    user_token = _login(admin_client, "alice", "pw")
+    user_system = _create_system(admin_client, user_token, "Alice System")
+
+    visible = admin_client.get("/systems", headers=_bearer(user_token)).json()
+    assert [system["id"] for system in visible] == [user_system["id"]]
+
+    headers = {
+        **_bearer(user_token),
+        "X-Probe-System-Id": str(admin_system["id"]),
+    }
+    assert admin_client.get("/components", headers=headers).status_code == 403
+
+    r = admin_client.post(
+        "/tokens/me",
+        json={"name": "forbidden", "system_id": admin_system["id"]},
+        headers=_bearer(user_token),
+    )
+    assert r.status_code == 403
+
+
+def test_delete_system_removes_its_tokens_and_data(admin_client):
+    admin_token = _login(admin_client)
+    system = _create_system(admin_client, admin_token, "Disposable")
+    api_token = _issue_system_token(
+        admin_client, admin_token, system["id"], "disposable-token"
+    )
+    admin_client.post(
+        "/traces",
+        json=_trace(trace_id="disposable-trace"),
+        headers={"X-Api-Key": api_token["token"]},
+    )
+
+    r = admin_client.delete(
+        f"/systems/{system['id']}", headers=_bearer(admin_token)
+    )
+    assert r.status_code == 204
+    assert (
+        admin_client.post(
+            "/traces",
+            json=_trace(trace_id="after-delete"),
+            headers={"X-Api-Key": api_token["token"]},
+        ).status_code
+        == 401
+    )
+    systems = admin_client.get("/systems", headers=_bearer(admin_token)).json()
+    assert all(row["id"] != system["id"] for row in systems)
+
+
 def test_deactivated_user_cannot_authenticate(admin_client):
     admin_token = _login(admin_client)
     r = admin_client.post(
