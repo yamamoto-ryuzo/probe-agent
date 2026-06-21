@@ -73,12 +73,20 @@ class LLMError(RuntimeError):
     pass
 
 
-def _is_reasoning_model(model: str) -> bool:
-    return bool(re.match(r"^(o1|o3|o4|gpt-5)", model))
+def is_reasoning_model(provider: str, model: str) -> bool:
+    normalized_provider = provider.strip().lower()
+    normalized_model = model.strip().lower()
+    patterns = {
+        "openai": r"^(o1|o3|o4|gpt-5)",
+        "anthropic": r"^(claude-(3-7|4)|claude-(opus|sonnet)-4)",
+        "gemini": r"^gemini-(2\.5|3)",
+    }
+    pattern = patterns.get(normalized_provider)
+    return bool(pattern and re.match(pattern, normalized_model))
 
 
 def _adapt_openai_messages(messages: List[Message], model: str) -> List[Message]:
-    if not _is_reasoning_model(model):
+    if not is_reasoning_model("openai", model):
         return messages
     return [
         {"role": "developer", "content": msg["content"]}
@@ -133,7 +141,7 @@ class OpenAIChatClient(LLMClient):
             "model": self.config.model,
             "messages": _adapt_openai_messages(messages, self.config.model),
         }
-        if _is_reasoning_model(self.config.model):
+        if is_reasoning_model("openai", self.config.model):
             if max_tokens is not None:
                 payload["max_completion_tokens"] = max_tokens
         else:
@@ -270,6 +278,10 @@ class MockLLMClient(LLMClient):
 @lru_cache(maxsize=1)
 def get_llm_client() -> LLMClient:
     config = LLMConfig.from_env()
+    return create_llm_client(config)
+
+
+def create_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "mock":
         return MockLLMClient()
     if config.provider == "anthropic":
