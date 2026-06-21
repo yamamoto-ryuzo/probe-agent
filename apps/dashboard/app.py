@@ -1235,6 +1235,49 @@ def render_repository_tab(system: Dict[str, Any]) -> None:
             for f in files:
                 st.write(f"- `{f['path']}` ({f['source_type']}, {f['size_bytes']} bytes)")
 
+        st.divider()
+        st.markdown("### Code Symbols")
+        symbols_data = api_get("/repository/symbols")
+        if symbols_data and symbols_data.get("symbol_count", 0) > 0:
+            st.caption(
+                f"Symbols: {symbols_data['symbol_count']} / "
+                f"Warnings: {symbols_data.get('warning_count', 0)}"
+            )
+            if symbols_data.get("intelligence_run"):
+                run = symbols_data["intelligence_run"]
+                st.caption(f"Decision: {run.get('decision_method', '-')}")
+            for sym in symbols_data.get("symbols", []):
+                kind_icon = {"class": "🔷", "function": "🔹", "async_function": "🔸"}.get(sym["kind"], "·")
+                extras = []
+                if sym.get("is_test"):
+                    extras.append("test")
+                if sym.get("is_pydantic_model"):
+                    extras.append("pydantic")
+                if sym.get("route_path"):
+                    extras.append(f"{sym.get('route_method', '?')} {sym['route_path']}")
+                if sym.get("component_id"):
+                    extras.append(f"component:{sym['component_id']}")
+                extra_str = f" [{', '.join(extras)}]" if extras else ""
+                st.write(
+                    f"{kind_icon} `{sym['qualified_name']}` "
+                    f"({sym['path']}:{sym['start_line']}-{sym['end_line']})"
+                    f"{extra_str}"
+                )
+            if symbols_data.get("warnings"):
+                with st.expander(f"Index warnings ({symbols_data['warning_count']})"):
+                    for w in symbols_data["warnings"]:
+                        st.warning(f"`{w['path']}`: {w['message']}")
+        else:
+            if st.button("Index code symbols"):
+                with st.spinner("Indexing Python symbols from snapshot..."):
+                    result = api_post("/repository/symbols/index")
+                if result:
+                    st.success(
+                        f"Indexed {result.get('symbol_count', 0)} symbols "
+                        f"({result.get('warning_count', 0)} warnings)"
+                    )
+                    st.rerun()
+
 
 def render_feature_map_tab(system: Dict[str, Any]) -> None:
     st.subheader("Feature Map")
@@ -1297,6 +1340,15 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
                     line_range = f"L{ev.get('start_line', '?')}-{ev.get('end_line', '?')}"
                     st.write(f"- `{ev['path']}` ({line_range}): {ev.get('summary', '')}")
 
+    code_links_data = api_get("/repository/code-links")
+    links_by_feature: Dict[str, List[Dict[str, Any]]] = {}
+    if code_links_data and code_links_data.get("links"):
+        if code_links_data.get("is_mock"):
+            st.info("Code links は mock provider で生成されたテスト用データです。")
+        for link in code_links_data["links"]:
+            fid = link.get("feature_id", "")
+            links_by_feature.setdefault(fid, []).append(link)
+
     for feature in drafts.get("feature_drafts", []):
         with st.expander(f"{feature['name']} · {feature['feature_id']}", expanded=True):
             st.write(feature.get("summary", ""))
@@ -1315,15 +1367,82 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
                     line_range = f"L{ev.get('start_line', '?')}-{ev.get('end_line', '?')}"
                     st.write(f"- `{ev['path']}` ({line_range}): {ev.get('summary', '')}")
 
+            feature_links = links_by_feature.get(feature["feature_id"], [])
+            if feature_links:
+                st.markdown("**Code Links**")
+                for link in feature_links:
+                    sym = link.get("symbol", {})
+                    status_icon = {
+                        "proposed": "🔶",
+                        "accepted": "✅",
+                        "rejected": "❌",
+                    }.get(link.get("review_status", ""), "·")
+                    confidence_pct = f"{link.get('confidence', 0) * 100:.0f}%"
+                    st.write(
+                        f"{status_icon} `{sym.get('qualified_name', '?')}` "
+                        f"({sym.get('path', '?')}:{sym.get('start_line', '?')}-{sym.get('end_line', '?')}) "
+                        f"· confidence {confidence_pct} · {link.get('review_status', '?')}"
+                    )
+                    if sym.get("component_id"):
+                        st.caption(f"Component: `{sym['component_id']}`")
+                    if link.get("is_stale"):
+                        st.error("この link は最新 snapshot に存在しない symbol を参照しています。")
+                    st.caption(f"Reason: {link.get('relation_reason', '')}")
+                    st.caption(
+                        "Audit: "
+                        f"{link.get('provider', '?')}/{link.get('model', '?')} · "
+                        f"prompt {link.get('prompt_version', '?')} · "
+                        f"schema {link.get('schema_version', '?')}"
+                    )
+                    link_id = link.get("id")
+                    review_col1, review_col2 = st.columns(2)
+                    with review_col1:
+                        if link.get("review_status") != "accepted":
+                            if st.button("Accept", key=f"accept-link-{link_id}"):
+                                api_put(
+                                    f"/repository/code-links/{link_id}/review",
+                                    {"review_status": "accepted"},
+                                )
+                                st.rerun()
+                    with review_col2:
+                        if link.get("review_status") != "rejected":
+                            if st.button("Reject", key=f"reject-link-{link_id}"):
+                                api_put(
+                                    f"/repository/code-links/{link_id}/review",
+                                    {"review_status": "rejected"},
+                                )
+                                st.rerun()
+
     st.divider()
     snapshot = api_get("/repository/snapshots/latest")
     if snapshot and snapshot.get("status") == "ready":
-        if st.button("Re-generate drafts"):
-            with st.spinner("ドラフトを再生成中..."):
-                result = api_post("/repository/drafts/generate")
-            if result:
-                st.success("ドラフトを再生成しました")
-                st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Re-generate drafts"):
+                with st.spinner("ドラフトを再生成中..."):
+                    result = api_post("/repository/drafts/generate")
+                if result:
+                    st.success("ドラフトを再生成しました")
+                    st.rerun()
+        with col2:
+            symbols_data = api_get("/repository/symbols")
+            has_symbols = symbols_data and symbols_data.get("symbol_count", 0) > 0
+            has_drafts = bool(drafts.get("feature_drafts"))
+            if has_symbols and has_drafts:
+                if st.button("Generate code links"):
+                    with st.spinner("Feature-to-Code マッピングを生成中..."):
+                        result = api_post("/repository/code-links/generate")
+                    if result:
+                        run = result.get("intelligence_run", {})
+                        if run.get("status") == "failed":
+                            st.error(f"生成に失敗しました: {run.get('error_details', '')}")
+                        else:
+                            st.success(f"Code links を生成しました ({len(result.get('links', []))} links)")
+                        st.rerun()
+            elif not has_symbols:
+                st.button("Generate code links", disabled=True, help="先に Repository タブで symbol index を実行してください")
+            else:
+                st.button("Generate code links", disabled=True, help="先にドラフトを生成してください")
 
 
 def render_probe_planner_tab(_system: Dict[str, Any]) -> None:

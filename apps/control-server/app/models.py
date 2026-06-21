@@ -209,6 +209,8 @@ IntelligenceRunType = Literal[
     "repository_drafts",
     "system_profile_draft",
     "feature_map_draft",
+    "symbol_index",
+    "feature_code_mapping",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 
@@ -373,6 +375,77 @@ class LatestDraftsOut(BaseModel):
     intelligence_run: Optional[IntelligenceRunOut] = None
     system_profile_draft: Optional[SystemProfileDraftOut] = None
     feature_drafts: List[FeatureDraftOut] = Field(default_factory=list)
+
+
+SymbolKind = Literal["module", "class", "function", "async_function"]
+LinkSource = Literal["reasoning_llm", "manual"]
+LinkReviewStatus = Literal["proposed", "accepted", "rejected"]
+
+
+class CodeSymbolOut(BaseModel):
+    id: int
+    snapshot_id: int
+    system_id: int
+    path: str
+    qualified_name: str
+    kind: SymbolKind
+    start_line: int
+    end_line: int
+    decorators: List[str] = Field(default_factory=list)
+    imports: List[str] = Field(default_factory=list)
+    docstring: Optional[str] = None
+    is_test: bool = False
+    is_pydantic_model: bool = False
+    route_path: Optional[str] = None
+    route_method: Optional[str] = None
+    component_id: Optional[str] = None
+
+
+class SymbolIndexWarningOut(BaseModel):
+    path: str
+    message: str
+
+
+class SymbolIndexOut(BaseModel):
+    snapshot_id: int
+    system_id: int
+    symbol_count: int
+    warning_count: int
+    symbols: List[CodeSymbolOut] = Field(default_factory=list)
+    warnings: List[SymbolIndexWarningOut] = Field(default_factory=list)
+    intelligence_run: Optional[IntelligenceRunOut] = None
+
+
+class FeatureCodeLinkOut(BaseModel):
+    id: int
+    system_id: int
+    snapshot_id: int
+    intelligence_run_id: int
+    feature_id: str
+    symbol: CodeSymbolOut
+    relation_reason: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    source: LinkSource
+    review_status: LinkReviewStatus
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    is_stale: bool = False
+    created_at: float
+    updated_at: float
+
+
+class FeatureCodeLinksOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    links: List[FeatureCodeLinkOut] = Field(default_factory=list)
+    is_mock: bool = False
+
+
+class LinkReviewUpdate(BaseModel):
+    review_status: LinkReviewStatus
 
 
 class ProjectIntelligenceMock(BaseModel):

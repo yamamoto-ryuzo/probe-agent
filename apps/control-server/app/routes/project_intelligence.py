@@ -8,6 +8,13 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_system_id
+from ..code_indexer import index_snapshot_files
+from ..code_mapper import (
+    FeatureContext,
+    generate_code_mapping,
+)
+from ..code_mapper import PROMPT_VERSION as MAPPING_PROMPT_VERSION
+from ..code_mapper import SCHEMA_VERSION as MAPPING_SCHEMA_VERSION
 from ..db import get_conn
 from ..draft_generator import (
     PROMPT_VERSION,
@@ -18,15 +25,19 @@ from ..draft_generator import (
 from ..git_ops import GitError, create_snapshot
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
+    CodeSymbolOut,
     DraftGenerationResult,
     ExperimentSummary,
     ExperimentVariant,
     FeatureCodeLink,
+    FeatureCodeLinkOut,
+    FeatureCodeLinksOut,
     FeatureDraftOut,
     FeatureEvidence,
     FeatureProfile,
     IntelligenceRunOut,
     LatestDraftsOut,
+    LinkReviewUpdate,
     ProbePlan,
     ProbePoint,
     ProjectIntelligenceMock,
@@ -35,6 +46,8 @@ from ..models import (
     RepositorySnapshot,
     SnapshotFileOut,
     SnapshotOut,
+    SymbolIndexOut,
+    SymbolIndexWarningOut,
     SystemProfile,
     SystemProfileDraftOut,
 )
@@ -648,6 +661,587 @@ def get_latest_drafts(
         system_profile_draft=sp_draft_out,
         feature_drafts=feature_drafts_out,
     )
+
+
+# ---------------------------------------------------------------------------
+# Symbol indexing (deterministic AST extraction)
+# ---------------------------------------------------------------------------
+
+
+def _symbol_out(row) -> CodeSymbolOut:
+    return CodeSymbolOut(
+        id=row["id"],
+        snapshot_id=row["snapshot_id"],
+        system_id=row["system_id"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        kind=row["kind"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        decorators=json.loads(row["decorators"]),
+        imports=json.loads(row["imports"]),
+        docstring=row["docstring"],
+        is_test=bool(row["is_test"]),
+        is_pydantic_model=bool(row["is_pydantic_model"]),
+        route_path=row["route_path"],
+        route_method=row["route_method"],
+        component_id=row["component_id"],
+    )
+
+
+@router.post(
+    "/repository/symbols/index",
+    response_model=SymbolIndexOut,
+    status_code=201,
+)
+def index_symbols_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SymbolIndexOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready. Create a successful snapshot first.",
+        )
+
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM code_symbols WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if existing["cnt"] > 0:
+            sym_rows = conn.execute(
+                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+                (snapshot_id,),
+            ).fetchall()
+            warn_rows = conn.execute(
+                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
+            run_row = conn.execute(
+                """
+                SELECT * FROM intelligence_runs
+                WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (system_id, snapshot_id),
+            ).fetchone()
+            return SymbolIndexOut(
+                snapshot_id=snapshot_id,
+                system_id=system_id,
+                symbol_count=len(sym_rows),
+                warning_count=len(warn_rows),
+                symbols=[_symbol_out(r) for r in sym_rows],
+                warnings=[
+                    SymbolIndexWarningOut(path=w["path"], message=w["message"])
+                    for w in warn_rows
+                ],
+                intelligence_run=_intelligence_run_out(run_row) if run_row else None,
+            )
+
+    with get_conn() as conn:
+        file_rows = conn.execute(
+            """
+            SELECT path, content FROM snapshot_files
+            WHERE snapshot_id = ?
+            ORDER BY path
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
+    started_at = time.time()
+    result = index_snapshot_files(files)
+    completed_at = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
+                        'n/a', 'n/a', 'deterministic',
+                        'completed', 0, ?, ?)
+                """,
+                (system_id, snapshot_id, started_at, completed_at),
+            )
+            run_id = cur.lastrowid
+
+            for sym in result.symbols:
+                conn.execute(
+                    """
+                    INSERT INTO code_symbols
+                        (snapshot_id, system_id, path, qualified_name, kind,
+                         start_line, end_line, decorators, imports, docstring,
+                         is_test, is_pydantic_model, route_path, route_method,
+                         component_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        system_id,
+                        sym.path,
+                        sym.qualified_name,
+                        sym.kind,
+                        sym.start_line,
+                        sym.end_line,
+                        json.dumps(sym.decorators),
+                        json.dumps(sym.imports),
+                        sym.docstring,
+                        1 if sym.is_test else 0,
+                        1 if sym.is_pydantic_model else 0,
+                        sym.route_path,
+                        sym.route_method,
+                        sym.component_id,
+                    ),
+                )
+
+            for warn in result.warnings:
+                conn.execute(
+                    """
+                    INSERT INTO symbol_index_warnings
+                        (snapshot_id, system_id, path, message)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (snapshot_id, system_id, warn.path, warn.message),
+                )
+
+            conn.execute("COMMIT")
+
+            sym_rows = conn.execute(
+                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+                (snapshot_id,),
+            ).fetchall()
+            warn_rows = conn.execute(
+                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return SymbolIndexOut(
+        snapshot_id=snapshot_id,
+        system_id=system_id,
+        symbol_count=len(sym_rows),
+        warning_count=len(warn_rows),
+        symbols=[_symbol_out(r) for r in sym_rows],
+        warnings=[
+            SymbolIndexWarningOut(path=w["path"], message=w["message"])
+            for w in warn_rows
+        ],
+        intelligence_run=_intelligence_run_out(run_row),
+    )
+
+
+@router.get("/repository/symbols", response_model=SymbolIndexOut)
+def get_symbols(
+    system_id: int = Depends(get_system_id),
+) -> SymbolIndexOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            return SymbolIndexOut(
+                snapshot_id=0,
+                system_id=system_id,
+                symbol_count=0,
+                warning_count=0,
+            )
+
+        snapshot_id = snapshot_row["id"]
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+            (snapshot_id,),
+        ).fetchall()
+        warn_rows = conn.execute(
+            "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id, snapshot_id),
+        ).fetchone()
+
+    return SymbolIndexOut(
+        snapshot_id=snapshot_id,
+        system_id=system_id,
+        symbol_count=len(sym_rows),
+        warning_count=len(warn_rows),
+        symbols=[_symbol_out(r) for r in sym_rows],
+        warnings=[
+            SymbolIndexWarningOut(path=w["path"], message=w["message"])
+            for w in warn_rows
+        ],
+        intelligence_run=_intelligence_run_out(run_row) if run_row else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feature-to-Code mapping (reasoning model)
+# ---------------------------------------------------------------------------
+
+
+def _link_out(conn, row) -> FeatureCodeLinkOut:
+    sym_row = conn.execute(
+        "SELECT * FROM code_symbols WHERE id = ?",
+        (row["symbol_id"],),
+    ).fetchone()
+    run_row = conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ?",
+        (row["intelligence_run_id"],),
+    ).fetchone()
+    latest_snapshot = conn.execute(
+        """
+        SELECT id FROM repository_snapshots
+        WHERE system_id = ? AND status = 'ready'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (row["system_id"],),
+    ).fetchone()
+    return FeatureCodeLinkOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        feature_id=row["feature_id"],
+        symbol=_symbol_out(sym_row),
+        relation_reason=row["relation_reason"],
+        confidence=row["confidence"],
+        source=row["source"],
+        review_status=row["review_status"],
+        provider=run_row["provider"],
+        model=run_row["model"],
+        prompt_version=run_row["prompt_version"],
+        schema_version=run_row["schema_version"],
+        is_stale=(
+            latest_snapshot is None
+            or latest_snapshot["id"] != row["snapshot_id"]
+        ),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@router.post(
+    "/repository/code-links/generate",
+    response_model=FeatureCodeLinksOut,
+    status_code=201,
+)
+def generate_code_links_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinksOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready.",
+        )
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    if not sym_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No symbols indexed for the latest snapshot. Run symbol indexing first.",
+        )
+
+    with get_conn() as conn:
+        draft_run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'repository_drafts' AND status = 'completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if draft_run_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No completed draft generation found. Generate drafts first.",
+            )
+
+        fd_rows = conn.execute(
+            """
+            SELECT * FROM feature_drafts
+            WHERE system_id = ? AND intelligence_run_id = ?
+            ORDER BY id
+            """,
+            (system_id, draft_run_row["id"]),
+        ).fetchall()
+
+    if not fd_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No feature drafts found. Generate drafts first.",
+        )
+
+    features = []
+    for fd in fd_rows:
+        with get_conn() as conn2:
+            evidence_rows = conn2.execute(
+                "SELECT summary FROM draft_evidence WHERE draft_type = 'feature' AND draft_id = ?",
+                (fd["id"],),
+            ).fetchall()
+
+        keywords = [fd["name"]]
+        for ev in evidence_rows:
+            keywords.extend(ev["summary"].split()[:5])
+
+        features.append(FeatureContext(
+            feature_id=fd["feature_id"],
+            name=fd["name"],
+            summary=fd["summary"],
+            user_value=fd["user_value"],
+            success_criteria=json.loads(fd["success_criteria"]),
+            risks=json.loads(fd["risks"]),
+            evidence_keywords=keywords,
+        ))
+
+    from ..code_indexer import CodeSymbol as CodeSymbolData
+
+    symbols = []
+    for sr in sym_rows:
+        symbols.append(CodeSymbolData(
+            path=sr["path"],
+            qualified_name=sr["qualified_name"],
+            kind=sr["kind"],
+            start_line=sr["start_line"],
+            end_line=sr["end_line"],
+            decorators=json.loads(sr["decorators"]),
+            imports=json.loads(sr["imports"]),
+            docstring=sr["docstring"],
+            is_test=bool(sr["is_test"]),
+            is_pydantic_model=bool(sr["is_pydantic_model"]),
+            route_path=sr["route_path"],
+            route_method=sr["route_method"],
+            component_id=sr["component_id"],
+        ))
+
+    llm_config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Feature-to-code mapping requires a configured reasoning model"
+            )
+        llm_client = create_llm_client(llm_config)
+        mapping_result = generate_code_mapping(llm_client, llm_config, features, symbols)
+    except LLMError as exc:
+        mapping_result = type("R", (), {
+            "provider": llm_config.provider,
+            "model": llm_config.model,
+            "is_mock": llm_config.provider == "mock",
+            "links": [],
+            "error": str(exc),
+        })()
+    completed_at = time.time()
+
+    status = "completed" if mapping_result.error is None else "failed"
+
+    symbol_key_to_id = {}
+    for sr in sym_rows:
+        symbol_key_to_id[(sr["path"], sr["qualified_name"])] = sr["id"]
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'feature_code_mapping', ?, ?, ?, ?, 'reasoning_llm',
+                        ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id,
+                    snapshot_id,
+                    mapping_result.provider,
+                    mapping_result.model,
+                    MAPPING_PROMPT_VERSION,
+                    MAPPING_SCHEMA_VERSION,
+                    status,
+                    mapping_result.error,
+                    1 if mapping_result.is_mock else 0,
+                    started_at,
+                    completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            now = time.time()
+            for link in mapping_result.links:
+                symbol_id = symbol_key_to_id.get(
+                    (link.symbol_path, link.symbol_qualified_name)
+                )
+                if symbol_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO feature_code_links
+                        (system_id, snapshot_id, intelligence_run_id,
+                         feature_id, symbol_id, relation_reason,
+                         confidence, source, review_status,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    """,
+                    (
+                        system_id,
+                        snapshot_id,
+                        run_id,
+                        link.feature_id,
+                        symbol_id,
+                        link.relation_reason,
+                        link.confidence,
+                        link.source,
+                        now,
+                        now,
+                    ),
+                )
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+
+            link_rows = conn.execute(
+                """
+                SELECT * FROM feature_code_links
+                WHERE intelligence_run_id = ?
+                ORDER BY feature_id, confidence DESC
+                """,
+                (run_id,),
+            ).fetchall()
+
+            links_out = [_link_out(conn, lr) for lr in link_rows]
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return FeatureCodeLinksOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        intelligence_run=_intelligence_run_out(run_row),
+        links=links_out,
+        is_mock=mapping_result.is_mock,
+    )
+
+
+@router.get("/repository/code-links", response_model=FeatureCodeLinksOut)
+def get_code_links(
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinksOut:
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'feature_code_mapping'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if run_row is None:
+            return FeatureCodeLinksOut(system_id=system_id)
+
+        link_rows = conn.execute(
+            """
+            SELECT * FROM feature_code_links
+            WHERE intelligence_run_id = ?
+            ORDER BY feature_id, confidence DESC
+            """,
+            (run_row["id"],),
+        ).fetchall()
+
+        return FeatureCodeLinksOut(
+            system_id=system_id,
+            snapshot_id=run_row["snapshot_id"],
+            intelligence_run=_intelligence_run_out(run_row),
+            links=[_link_out(conn, lr) for lr in link_rows],
+            is_mock=bool(run_row["is_mock"]),
+        )
+
+
+@router.put(
+    "/repository/code-links/{link_id}/review",
+    response_model=FeatureCodeLinkOut,
+)
+def review_code_link(
+    link_id: int,
+    payload: LinkReviewUpdate,
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinkOut:
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM feature_code_links WHERE id = ? AND system_id = ?",
+            (link_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Link not found")
+        conn.execute(
+            """
+            UPDATE feature_code_links
+            SET review_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload.review_status, now, link_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM feature_code_links WHERE id = ?",
+            (link_id,),
+        ).fetchone()
+        return _link_out(conn, row)
 
 
 # ---------------------------------------------------------------------------
