@@ -20,6 +20,9 @@ Use this skill for files under:
 - `shadow` mode must return the current implementation output.
 - Candidate output must only be recorded for comparison.
 - Do not implement production `replace` behavior in MVP.
+- Feature Intelligence may propose instrumentation, but SDK code and target
+  source must only be changed in an approved isolated worktree. An LLM plan
+  must never weaken the SDK's fail-open host-application guarantees.
 
 ## Required Tests
 

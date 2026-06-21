@@ -15,6 +15,10 @@ Use this skill when changing:
 - mode definitions
 - API payloads
 - SDK/server/dashboard contract
+- repository snapshots and evidence
+- Feature profiles and code links
+- Probe Plans and experiment contracts
+- reasoning-run audit metadata
 
 ## Required Steps
 
@@ -25,10 +29,22 @@ Use this skill when changing:
 5. Update example payloads.
 6. Update tests.
 7. Update docs if public behavior changed.
+8. Classify fields as deterministic fact, reasoning output, audit metadata, or
+   manual decision; do not conflate them.
+9. Update mock fixtures and mark them explicitly as mock.
 
 ## Compatibility
 
 Prefer backward-compatible changes during MVP unless there is a strong reason.
+
+For intelligence schemas:
+
+- include `system_id` or otherwise prove System ownership
+- include snapshot/commit provenance
+- include `decision_method`
+- include provider/model/prompt/schema version for reasoning outputs
+- represent failed reasoning runs without generating fallback content
+- use enums only for small, explicit finite sets
 
 If making a breaking change, document:
 

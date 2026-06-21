@@ -1,5 +1,5 @@
 ---
-description: Use when implementing or modifying the Control Server APIs for traces, policies, components, and shadow results.
+description: Use when implementing or modifying Control Server APIs, persistence, repository intelligence, reasoning runs, traces, policies, components, generation, and experiments.
 ---
 
 # Control Server Skill
@@ -28,10 +28,42 @@ Use this skill for files under:
 - `PUT /criteria/{criterion_id}`
 - `POST /traces/{trace_id}/evaluate`, `GET /traces/{trace_id}/evaluations`
 
-Evaluation is rule-based only (`app/evaluator.py`); never call an LLM in the MVP.
+The Evaluation Context criterion engine is rule-based only (`app/evaluator.py`);
+do not call an LLM from that criterion engine.
 `exact_match` / `contains` / `regex` / `json_equal` / `required_keys` are decided
 deterministically; `natural_language` is always recorded as `needs_review`.
 Re-evaluating a trace replaces its prior results (idempotent).
+
+This restriction applies to the finite evaluation-criterion engine only.
+Feature Intelligence has different requirements: open-ended understanding,
+mapping, planning, and interpretation must call a reasoning model through the
+provider-neutral LLM layer. Do not reuse `app/evaluator.py` as a heuristic
+fallback for intelligence work.
+
+## Feature Intelligence APIs (issues #23-#26)
+
+The current `GET /project-intelligence` response is a mock contract.
+
+- #23 owns repository configuration, snapshots, evidence-backed drafts, and
+  intelligence-run persistence.
+- #24 owns code symbols and Feature-to-Code links.
+- #25 owns Probe Plans, temporary instrumentation patches, and validation runs.
+- #26 owns experiments, variants, artifacts, metrics, and interpretations.
+
+Only add tables needed by the current issue. Every new table must be scoped by
+`system_id` where applicable and have explicit lifecycle/query tests.
+
+Keep these storage concerns separate:
+
+- immutable or reproducible deterministic facts: snapshot, file metadata,
+  symbols, command results, raw metrics
+- reasoning outputs: drafts, links, plans, interpretations
+- audit metadata: provider, model, prompt/schema version, decision method,
+  source snapshot, timestamps, error
+- manual decisions: accepted/rejected/adopted notes
+
+Reasoning failure must be represented as a failed run. Do not synthesize a
+heuristic result.
 
 ## Authentication and user management
 
@@ -64,6 +96,11 @@ Re-evaluating a trace replaces its prior results (idempotent).
   - server error must not imply replace behavior
 - Never expose arbitrary code execution endpoints.
 - Never log or return raw tokens/passwords; raw tokens are shown only once on creation.
+- Repository paths must not permit reads outside the configured Git repository.
+- Never read target source directly from the mutable working tree.
+- Commands must come from explicit configuration, run in an isolated workspace,
+  and enforce timeout/network/environment policies.
+- Deterministic safety denylists override LLM output.
 
 ## Required Tests
 
@@ -79,3 +116,8 @@ Add or update tests for:
 - self-service tokens: issue/list/revoke own tokens, cannot touch other users' tokens,
   legacy key / anonymous rejected
 - password reset and role change permissions and guards
+- System isolation for every intelligence table/API
+- committed-only snapshot behavior
+- reasoning-required operations fail closed without heuristic fallback
+- reasoning metadata and structured-output validation
+- target repository unchanged after workspace operations
