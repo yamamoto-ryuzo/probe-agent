@@ -327,6 +327,75 @@ CREATE TABLE IF NOT EXISTS draft_evidence (
 
 CREATE INDEX IF NOT EXISTS idx_draft_evidence_draft
     ON draft_evidence (draft_type, draft_id);
+
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    start_line      INTEGER NOT NULL,
+    end_line        INTEGER NOT NULL,
+    decorators      TEXT NOT NULL DEFAULT '[]',
+    docstring       TEXT,
+    is_test         INTEGER NOT NULL DEFAULT 0,
+    is_pydantic_model INTEGER NOT NULL DEFAULT 0,
+    route_path      TEXT,
+    route_method    TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_symbols_snapshot_name
+    ON code_symbols (snapshot_id, qualified_name, path);
+
+CREATE INDEX IF NOT EXISTS idx_code_symbols_snapshot
+    ON code_symbols (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_symbols_system
+    ON code_symbols (system_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS symbol_index_warnings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
+    ON symbol_index_warnings (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS feature_code_links (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    snapshot_id     INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    feature_id      TEXT NOT NULL,
+    symbol_id       INTEGER NOT NULL,
+    relation_reason TEXT NOT NULL,
+    confidence      REAL NOT NULL DEFAULT 0.0,
+    source          TEXT NOT NULL DEFAULT 'llm',
+    review_status   TEXT NOT NULL DEFAULT 'proposed',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_system
+    ON feature_code_links (system_id, snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_feature
+    ON feature_code_links (system_id, feature_id);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_run
+    ON feature_code_links (intelligence_run_id);
 """
 
 
