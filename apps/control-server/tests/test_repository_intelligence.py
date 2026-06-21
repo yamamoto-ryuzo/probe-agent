@@ -7,6 +7,7 @@ and safety boundaries.
 
 import json
 import os
+import sqlite3
 import subprocess
 import time
 
@@ -20,6 +21,9 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_ADMIN_USERNAME", "root")
     monkeypatch.setenv("CONTROL_ADMIN_PASSWORD", "s3cret")
     monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("PROBE_REPOSITORY_ROOTS", str(tmp_path))
+    monkeypatch.delenv("INTELLIGENCE_LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("INTELLIGENCE_LLM_MODEL", raising=False)
     monkeypatch.delenv("CONTROL_API_KEYS", raising=False)
     from app.llm import get_llm_client
 
@@ -291,6 +295,135 @@ class TestSnapshots:
         assert b"MODIFIED" not in content
         assert b"world" in content
 
+    def test_snapshot_excludes_staged_uncommitted_files(self, admin_client, git_repo):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Staged")
+        h = _headers(token, system["id"])
+
+        (git_repo / "staged-secret.txt").write_text("must not be indexed\n")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "staged-secret.txt"],
+            check=True,
+            capture_output=True,
+        )
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": []},
+            headers=h,
+        )
+
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.status_code == 201
+        paths = {f["path"] for f in r.json()["files"]}
+        assert "staged-secret.txt" not in paths
+
+    def test_snapshot_rejects_repository_outside_allowed_roots(
+        self, admin_client, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "OutsideRoot")
+        h = _headers(token, system["id"])
+        outside = tmp_path.parent / f"{tmp_path.name}-outside"
+        outside.mkdir()
+        subprocess.run(["git", "init", str(outside)], check=True, capture_output=True)
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(outside)},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.json()["status"] == "failed"
+        assert "PROBE_REPOSITORY_ROOTS" in r.json()["error_summary"]
+
+    def test_snapshot_rejects_git_directory_outside_allowed_roots(
+        self, admin_client, git_repo, tmp_path
+    ):
+        linked_worktree = tmp_path / "linked-worktree"
+        outside_git_dir = tmp_path.parent / f"{tmp_path.name}-external-git"
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--separate-git-dir",
+                str(outside_git_dir),
+                str(git_repo),
+                str(linked_worktree),
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "ExternalGitDir")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(linked_worktree)},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.json()["status"] == "failed"
+        assert "Git directory is outside" in r.json()["error_summary"]
+
+    def test_snapshot_reports_oversized_included_file(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        import app.git_ops as git_ops
+
+        (git_repo / "large.txt").write_text("x" * 128)
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "large.txt"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "large"],
+            check=True,
+            capture_output=True,
+        )
+        monkeypatch.setattr(git_ops, "MAX_FILE_SIZE", 64)
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Oversized")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["large.txt"]},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.json()["status"] == "failed"
+        assert "MAX_FILE_SIZE" in r.json()["error_summary"]
+
+    def test_snapshot_skips_committed_symlinks(
+        self, admin_client, git_repo, tmp_path
+    ):
+        outside = tmp_path / "outside-secret.txt"
+        outside.write_text("secret outside repository\n")
+        os.symlink(outside, git_repo / "linked-secret.txt")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "linked-secret.txt"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "symlink"],
+            check=True,
+            capture_output=True,
+        )
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Symlink")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": []},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        paths = {f["path"] for f in r.json()["files"]}
+        assert "linked-secret.txt" not in paths
+
     def test_snapshot_invalid_path(self, admin_client, tmp_path):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "InvalidPath")
@@ -485,6 +618,180 @@ class TestDraftGeneration:
         assert r.json()["name"] == "Original Profile"
         assert r.json()["purpose"] == "manually set"
 
+    def test_generation_uses_persisted_snapshot_content(
+        self, admin_client, git_repo
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "PersistedContent")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["README.md"]},
+            headers=h,
+        )
+        admin_client.post("/repository/snapshots", headers=h)
+
+        # Draft generation must not re-read the configured repository.
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo.parent / "missing-repo")},
+            headers=h,
+        )
+        r = admin_client.post("/repository/drafts/generate", headers=h)
+        assert r.status_code == 201
+        assert r.json()["intelligence_run"]["status"] == "completed"
+
+    def test_generation_does_not_fall_back_to_older_snapshot(
+        self, admin_client, git_repo
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "NoStaleSnapshot")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["README.md"]},
+            headers=h,
+        )
+        admin_client.post("/repository/snapshots", headers=h)
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo.parent / "missing-repo")},
+            headers=h,
+        )
+        failed = admin_client.post("/repository/snapshots", headers=h).json()
+        assert failed["status"] == "failed"
+
+        r = admin_client.post("/repository/drafts/generate", headers=h)
+        assert r.status_code == 400
+        assert "Latest snapshot is not ready" in r.json()["detail"]
+
+    def test_non_reasoning_model_is_rejected_and_audited(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "NonReasoning")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["README.md"]},
+            headers=h,
+        )
+        admin_client.post("/repository/snapshots", headers=h)
+
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
+        monkeypatch.setenv("LLM_API_KEY", "unused")
+        r = admin_client.post("/repository/drafts/generate", headers=h)
+        assert r.status_code == 201
+        run = r.json()["intelligence_run"]
+        assert run["status"] == "failed"
+        assert "reasoning model" in run["error_details"]
+        assert r.json()["system_profile_draft"] is None
+        assert r.json()["feature_drafts"] == []
+
+        latest = admin_client.get("/repository/drafts/latest", headers=h).json()
+        assert latest["intelligence_run"]["id"] == run["id"]
+        assert latest["intelligence_run"]["status"] == "failed"
+        assert latest["system_profile_draft"] is None
+
+    def test_invalid_evidence_range_fails_without_persisting_drafts(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        from app.llm import LLMClient
+        from app.routes import project_intelligence
+
+        class InvalidEvidenceClient(LLMClient):
+            def generate_text(self, messages, *, temperature=None, max_tokens=None):
+                return json.dumps(
+                    {
+                        "system_profile": {
+                            "name": "Invalid",
+                            "purpose": "Invalid evidence test",
+                            "target_users": ["developers"],
+                            "stakeholder_value": "validation",
+                            "constraints": [],
+                            "success_criteria": [],
+                            "evidence": [
+                                {
+                                    "path": "README.md",
+                                    "start_line": 1,
+                                    "end_line": 9999,
+                                    "summary": "outside file bounds",
+                                }
+                            ],
+                        },
+                        "features": [
+                            {
+                                "feature_id": "invalid",
+                                "name": "Invalid",
+                                "summary": "Invalid",
+                                "user_value": "Invalid",
+                                "success_criteria": [],
+                                "risks": [],
+                                "evidence": [
+                                    {
+                                        "path": "README.md",
+                                        "start_line": 1,
+                                        "end_line": 1,
+                                        "summary": "valid range",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "InvalidEvidence")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["README.md"]},
+            headers=h,
+        )
+        admin_client.post("/repository/snapshots", headers=h)
+
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_MODEL", "gpt-5.4")
+        monkeypatch.setenv("LLM_API_KEY", "unused")
+        monkeypatch.setattr(
+            project_intelligence,
+            "create_llm_client",
+            lambda _config: InvalidEvidenceClient(),
+        )
+        r = admin_client.post("/repository/drafts/generate", headers=h)
+        assert r.status_code == 201
+        body = r.json()
+        assert body["intelligence_run"]["status"] == "failed"
+        assert "line range exceeds" in body["intelligence_run"]["error_details"]
+        assert body["system_profile_draft"] is None
+        assert body["feature_drafts"] == []
+
+    def test_drafts_are_system_scoped(self, admin_client, git_repo):
+        token = _login(admin_client)
+        sys_a = _create_system(admin_client, token, "DraftScopeA")
+        sys_b = _create_system(admin_client, token, "DraftScopeB")
+        headers_a = _headers(token, sys_a["id"])
+        headers_b = _headers(token, sys_b["id"])
+
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": ["README.md"]},
+            headers=headers_a,
+        )
+        admin_client.post("/repository/snapshots", headers=headers_a)
+        admin_client.post("/repository/drafts/generate", headers=headers_a)
+
+        other = admin_client.get(
+            "/repository/drafts/latest", headers=headers_b
+        ).json()
+        assert other["system_id"] == sys_b["id"]
+        assert other["snapshot"] is None
+        assert other["intelligence_run"] is None
+        assert other["system_profile_draft"] is None
+        assert other["feature_drafts"] == []
+
 
 # ---------------------------------------------------------------------------
 # Intelligence run audit tests
@@ -537,11 +844,11 @@ class TestIntelligenceRunAudit:
 
 class TestGitSafety:
     def test_path_traversal_rejected(self):
-        from app.git_ops import _is_safe_path
+        from app.git_ops import _is_safe_git_path
 
-        assert not _is_safe_path("../etc/passwd", "/repo")
-        assert not _is_safe_path("src/../../etc/passwd", "/repo")
-        assert not _is_safe_path("/absolute/path", "/repo")
+        assert not _is_safe_git_path("../etc/passwd")
+        assert not _is_safe_git_path("src/../../etc/passwd")
+        assert not _is_safe_git_path("/absolute/path")
 
     def test_classify_source_type(self):
         from app.git_ops import classify_source_type
@@ -561,6 +868,36 @@ class TestGitSafety:
         assert _matches_patterns("private.key", DEFAULT_EXCLUDE)
         assert _matches_patterns("credentials.json", DEFAULT_EXCLUDE)
         assert _matches_patterns("secrets/api.txt", DEFAULT_EXCLUDE)
+
+
+class TestRepositorySchemaMigration:
+    def test_adds_snapshot_content_column(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old-repository-schema.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            CREATE TABLE snapshot_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT
+            )
+            """
+        )
+        conn.close()
+
+        monkeypatch.setenv("PROBE_DB_PATH", str(db_file))
+        from app.db import get_conn, init_db
+
+        init_db()
+        with get_conn() as migrated:
+            columns = {
+                row["name"]
+                for row in migrated.execute("PRAGMA table_info(snapshot_files)")
+            }
+        assert "content" in columns
 
 
 # ---------------------------------------------------------------------------

@@ -1,14 +1,22 @@
 import json
+import os
 import time
+import hashlib
+from dataclasses import replace
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import get_system_id
 from ..db import get_conn
-from ..draft_generator import generate_drafts
+from ..draft_generator import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
+    GenerationResult,
+    generate_drafts,
+)
 from ..git_ops import GitError, create_snapshot
-from ..llm import LLMConfig, get_llm_client
+from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     DraftGenerationResult,
     ExperimentSummary,
@@ -191,24 +199,37 @@ def create_snapshot_endpoint(
     completed_at = time.time()
 
     with get_conn() as conn:
-        conn.execute(
-            """
-            UPDATE repository_snapshots
-            SET commit_sha = ?, status = 'ready', file_count = ?,
-                total_size = ?, completed_at = ?
-            WHERE id = ?
-            """,
-            (commit_sha, len(files), total_size, completed_at, snapshot_id),
-        )
-        for f in files:
+        conn.execute("BEGIN")
+        try:
             conn.execute(
                 """
-                INSERT INTO snapshot_files
-                    (snapshot_id, path, source_type, size_bytes, content_hash)
-                VALUES (?, ?, ?, ?, ?)
+                UPDATE repository_snapshots
+                SET commit_sha = ?, status = 'ready', file_count = ?,
+                    total_size = ?, completed_at = ?
+                WHERE id = ?
                 """,
-                (snapshot_id, f.path, f.source_type, f.size_bytes, f.content_hash),
+                (commit_sha, len(files), total_size, completed_at, snapshot_id),
             )
+            for f in files:
+                conn.execute(
+                    """
+                    INSERT INTO snapshot_files
+                        (snapshot_id, path, source_type, size_bytes, content_hash, content)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        f.path,
+                        f.source_type,
+                        f.size_bytes,
+                        f.content_hash,
+                        f.content,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         row = conn.execute(
             "SELECT * FROM repository_snapshots WHERE id = ?", (snapshot_id,)
         ).fetchone()
@@ -325,167 +346,226 @@ def generate_drafts_endpoint(
         snapshot_row = conn.execute(
             """
             SELECT * FROM repository_snapshots
-            WHERE system_id = ? AND status = 'ready'
+            WHERE system_id = ?
             ORDER BY id DESC LIMIT 1
             """,
             (system_id,),
         ).fetchone()
-    if snapshot_row is None:
+    if snapshot_row is None or snapshot_row["status"] != "ready":
         raise HTTPException(
             status_code=400,
-            detail="No ready snapshot. Create a snapshot first.",
+            detail="Latest snapshot is not ready. Create a successful snapshot first.",
         )
 
     snapshot_id = snapshot_row["id"]
 
     with get_conn() as conn:
         file_rows = conn.execute(
-            "SELECT path, source_type, size_bytes, content_hash FROM snapshot_files WHERE snapshot_id = ?",
+            """
+            SELECT path, source_type, size_bytes, content_hash, content
+            FROM snapshot_files
+            WHERE snapshot_id = ?
+            ORDER BY path
+            """,
             (snapshot_id,),
         ).fetchall()
 
-    from ..git_ops import IndexedFile, read_file_at_commit
-
-    config_row = None
-    with get_conn() as conn:
-        config_row = conn.execute(
-            "SELECT repo_path FROM repository_configs WHERE system_id = ?",
-            (system_id,),
-        ).fetchone()
+    from ..git_ops import IndexedFile
 
     indexed_files = []
     for fr in file_rows:
-        content = b""
-        if config_row:
-            try:
-                content = read_file_at_commit(
-                    config_row["repo_path"],
-                    snapshot_row["commit_sha"],
-                    fr["path"],
-                )
-            except Exception:
-                pass
-        indexed_files.append(IndexedFile(
-            path=fr["path"],
-            source_type=fr["source_type"],
-            size_bytes=fr["size_bytes"],
-            content_hash=fr["content_hash"] or "",
-            content=content,
-        ))
+        content = bytes(fr["content"] or b"")
+        if len(content) != fr["size_bytes"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Snapshot content is unavailable or corrupt: {fr['path']}",
+            )
+        if hashlib.sha256(content).hexdigest() != (fr["content_hash"] or ""):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Snapshot content hash mismatch: {fr['path']}",
+            )
+        indexed_files.append(
+            IndexedFile(
+                path=fr["path"],
+                source_type=fr["source_type"],
+                size_bytes=fr["size_bytes"],
+                content_hash=fr["content_hash"] or "",
+                content=content,
+            )
+        )
 
     llm_config = LLMConfig.from_env()
-    llm_client = get_llm_client()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
 
     started_at = time.time()
-    result = generate_drafts(llm_client, llm_config, indexed_files)
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Repository draft generation requires a configured reasoning model"
+            )
+        if not indexed_files:
+            raise LLMError("Snapshot contains no files")
+        llm_client = create_llm_client(llm_config)
+        result = generate_drafts(llm_client, llm_config, indexed_files)
+    except LLMError as exc:
+        result = GenerationResult(
+            provider=llm_config.provider,
+            model=llm_config.model,
+            is_mock=llm_config.provider == "mock",
+            system_profile=None,
+            features=[],
+            error=str(exc),
+        )
     completed_at = time.time()
 
     status = "completed" if result.error is None else "failed"
     decision_method = "reasoning_llm"
 
     with get_conn() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO intelligence_runs
-                (system_id, snapshot_id, run_type, provider, model,
-                 prompt_version, schema_version, decision_method,
-                 status, error_details, is_mock, started_at, completed_at)
-            VALUES (?, ?, 'system_profile_draft', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                system_id, snapshot_id,
-                result.provider, result.model,
-                "v1", "v1", decision_method,
-                status, result.error,
-                1 if result.is_mock else 0,
-                started_at, completed_at,
-            ),
-        )
-        run_id = cur.lastrowid
-
-        sp_draft_out = None
-        if result.system_profile:
-            sp = result.system_profile
-            now = time.time()
+        conn.execute("BEGIN")
+        try:
             cur = conn.execute(
                 """
-                INSERT INTO system_profile_drafts
-                    (system_id, intelligence_run_id, snapshot_id,
-                     name, purpose, target_users, stakeholder_value,
-                     constraints, success_criteria, is_mock, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'repository_drafts', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    system_id, run_id, snapshot_id,
-                    sp.name, sp.purpose,
-                    json.dumps(sp.target_users),
-                    sp.stakeholder_value,
-                    json.dumps(sp.constraints),
-                    json.dumps(sp.success_criteria),
+                    system_id,
+                    snapshot_id,
+                    result.provider,
+                    result.model,
+                    PROMPT_VERSION,
+                    SCHEMA_VERSION,
+                    decision_method,
+                    status,
+                    result.error,
                     1 if result.is_mock else 0,
-                    now,
+                    started_at,
+                    completed_at,
                 ),
             )
-            sp_draft_id = cur.lastrowid
-            for ev in sp.evidence:
-                conn.execute(
-                    """
-                    INSERT INTO draft_evidence
-                        (system_id, draft_type, draft_id, path,
-                         start_line, end_line, summary)
-                    VALUES (?, 'system_profile', ?, ?, ?, ?, ?)
-                    """,
-                    (system_id, sp_draft_id, ev.path,
-                     ev.start_line, ev.end_line, ev.summary),
-                )
-            sp_row = conn.execute(
-                "SELECT * FROM system_profile_drafts WHERE id = ?",
-                (sp_draft_id,),
-            ).fetchone()
-            sp_draft_out = _sp_draft_out(conn, sp_row)
+            run_id = cur.lastrowid
 
-        feature_drafts_out = []
-        for fd in result.features:
-            now = time.time()
-            cur = conn.execute(
-                """
-                INSERT INTO feature_drafts
-                    (system_id, intelligence_run_id, snapshot_id,
-                     feature_id, name, summary, user_value,
-                     success_criteria, risks, decision_method,
-                     is_mock, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    system_id, run_id, snapshot_id,
-                    fd.feature_id, fd.name, fd.summary, fd.user_value,
-                    json.dumps(fd.success_criteria),
-                    json.dumps(fd.risks),
-                    fd.decision_method,
-                    1 if result.is_mock else 0,
-                    now,
-                ),
-            )
-            fd_id = cur.lastrowid
-            for ev in fd.evidence:
-                conn.execute(
+            sp_draft_out = None
+            if result.system_profile:
+                sp = result.system_profile
+                now = time.time()
+                cur = conn.execute(
                     """
-                    INSERT INTO draft_evidence
-                        (system_id, draft_type, draft_id, path,
-                         start_line, end_line, summary)
-                    VALUES (?, 'feature', ?, ?, ?, ?, ?)
+                    INSERT INTO system_profile_drafts
+                        (system_id, intelligence_run_id, snapshot_id,
+                         name, purpose, target_users, stakeholder_value,
+                         constraints, success_criteria, is_mock, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (system_id, fd_id, ev.path,
-                     ev.start_line, ev.end_line, ev.summary),
+                    (
+                        system_id,
+                        run_id,
+                        snapshot_id,
+                        sp.name,
+                        sp.purpose,
+                        json.dumps(sp.target_users),
+                        sp.stakeholder_value,
+                        json.dumps(sp.constraints),
+                        json.dumps(sp.success_criteria),
+                        1 if result.is_mock else 0,
+                        now,
+                    ),
                 )
-            fd_row = conn.execute(
-                "SELECT * FROM feature_drafts WHERE id = ?", (fd_id,)
-            ).fetchone()
-            feature_drafts_out.append(_feature_draft_out(conn, fd_row))
+                sp_draft_id = cur.lastrowid
+                for ev in sp.evidence:
+                    conn.execute(
+                        """
+                        INSERT INTO draft_evidence
+                            (system_id, draft_type, draft_id, path,
+                             start_line, end_line, summary)
+                        VALUES (?, 'system_profile', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            system_id,
+                            sp_draft_id,
+                            ev.path,
+                            ev.start_line,
+                            ev.end_line,
+                            ev.summary,
+                        ),
+                    )
+                sp_row = conn.execute(
+                    "SELECT * FROM system_profile_drafts WHERE id = ?",
+                    (sp_draft_id,),
+                ).fetchone()
+                sp_draft_out = _sp_draft_out(conn, sp_row)
 
-        run_row = conn.execute(
-            "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
-        ).fetchone()
+            feature_drafts_out = []
+            for fd in result.features:
+                now = time.time()
+                cur = conn.execute(
+                    """
+                    INSERT INTO feature_drafts
+                        (system_id, intelligence_run_id, snapshot_id,
+                         feature_id, name, summary, user_value,
+                         success_criteria, risks, decision_method,
+                         is_mock, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        system_id,
+                        run_id,
+                        snapshot_id,
+                        fd.feature_id,
+                        fd.name,
+                        fd.summary,
+                        fd.user_value,
+                        json.dumps(fd.success_criteria),
+                        json.dumps(fd.risks),
+                        fd.decision_method,
+                        1 if result.is_mock else 0,
+                        now,
+                    ),
+                )
+                fd_id = cur.lastrowid
+                for ev in fd.evidence:
+                    conn.execute(
+                        """
+                        INSERT INTO draft_evidence
+                            (system_id, draft_type, draft_id, path,
+                             start_line, end_line, summary)
+                        VALUES (?, 'feature', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            system_id,
+                            fd_id,
+                            ev.path,
+                            ev.start_line,
+                            ev.end_line,
+                            ev.summary,
+                        ),
+                    )
+                fd_row = conn.execute(
+                    "SELECT * FROM feature_drafts WHERE id = ?", (fd_id,)
+                ).fetchone()
+                feature_drafts_out.append(_feature_draft_out(conn, fd_row))
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     return DraftGenerationResult(
         intelligence_run=_intelligence_run_out(run_row),
@@ -499,54 +579,67 @@ def get_latest_drafts(
     system_id: int = Depends(get_system_id),
 ) -> LatestDraftsOut:
     with get_conn() as conn:
-        snapshot_row = conn.execute(
-            """
-            SELECT * FROM repository_snapshots
-            WHERE system_id = ? AND status = 'ready'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (system_id,),
-        ).fetchone()
-
-        snapshot_out = None
-        if snapshot_row:
-            snapshot_out = _snapshot_out(conn, snapshot_row, include_files=True)
-
         run_row = conn.execute(
             """
             SELECT * FROM intelligence_runs
-            WHERE system_id = ? AND status = 'completed'
+            WHERE system_id = ?
             ORDER BY id DESC LIMIT 1
             """,
             (system_id,),
         ).fetchone()
 
+        if run_row:
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM repository_snapshots
+                WHERE system_id = ? AND id = ?
+                """,
+                (system_id, run_row["snapshot_id"]),
+            ).fetchone()
+        else:
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM repository_snapshots
+                WHERE system_id = ? AND status = 'ready'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (system_id,),
+            ).fetchone()
+
+        snapshot_out = (
+            _snapshot_out(conn, snapshot_row, include_files=True)
+            if snapshot_row
+            else None
+        )
         run_out = None
         sp_draft_out = None
         feature_drafts_out = []
 
         if run_row:
             run_out = _intelligence_run_out(run_row)
-            sp_row = conn.execute(
-                """
-                SELECT * FROM system_profile_drafts
-                WHERE system_id = ? AND intelligence_run_id = ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (system_id, run_row["id"]),
-            ).fetchone()
-            if sp_row:
-                sp_draft_out = _sp_draft_out(conn, sp_row)
+            if run_row["status"] == "completed":
+                sp_row = conn.execute(
+                    """
+                    SELECT * FROM system_profile_drafts
+                    WHERE system_id = ? AND intelligence_run_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (system_id, run_row["id"]),
+                ).fetchone()
+                if sp_row:
+                    sp_draft_out = _sp_draft_out(conn, sp_row)
 
-            fd_rows = conn.execute(
-                """
-                SELECT * FROM feature_drafts
-                WHERE system_id = ? AND intelligence_run_id = ?
-                ORDER BY id
-                """,
-                (system_id, run_row["id"]),
-            ).fetchall()
-            feature_drafts_out = [_feature_draft_out(conn, r) for r in fd_rows]
+                fd_rows = conn.execute(
+                    """
+                    SELECT * FROM feature_drafts
+                    WHERE system_id = ? AND intelligence_run_id = ?
+                    ORDER BY id
+                    """,
+                    (system_id, run_row["id"]),
+                ).fetchall()
+                feature_drafts_out = [
+                    _feature_draft_out(conn, row) for row in fd_rows
+                ]
 
     return LatestDraftsOut(
         system_id=system_id,

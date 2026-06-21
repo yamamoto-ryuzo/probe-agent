@@ -205,7 +205,11 @@ class RepositorySnapshot(BaseModel):
 SourceType = Literal["documentation", "source", "test", "configuration"]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
-IntelligenceRunType = Literal["system_profile_draft", "feature_map_draft"]
+IntelligenceRunType = Literal[
+    "repository_drafts",
+    "system_profile_draft",
+    "feature_map_draft",
+]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 
 

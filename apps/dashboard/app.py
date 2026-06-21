@@ -1171,10 +1171,15 @@ def render_repository_tab(system: Dict[str, Any]) -> None:
         st.info("スナップショットはまだ作成されていません。")
 
     st.markdown("### Repository Configuration")
+    st.caption(
+        "Control Serverから見えるpathを指定します。Docker Composeの既定では "
+        "`/repositories` 配下だけがread-onlyで許可されます。"
+    )
     with st.form(f"repo-config-{system['id']}"):
         repo_path = st.text_input(
             "Repository path",
             value=(config or {}).get("repo_path", ""),
+            placeholder="/repositories/my-project",
         )
         include_patterns = st.text_area(
             "Include patterns (1行1パターン)",
@@ -1235,6 +1240,16 @@ def render_feature_map_tab(system: Dict[str, Any]) -> None:
     st.subheader("Feature Map")
 
     drafts = api_get("/repository/drafts/latest")
+    latest_run = (drafts or {}).get("intelligence_run")
+    if latest_run and latest_run.get("status") == "failed":
+        st.error(
+            "最新のドラフト生成に失敗しました: "
+            + (latest_run.get("error_details") or "unknown error")
+        )
+        st.caption(
+            f"Provider: {latest_run.get('provider', '-')} / "
+            f"Model: {latest_run.get('model', '-')}"
+        )
     if not drafts or (not drafts.get("system_profile_draft") and not drafts.get("feature_drafts")):
         st.info("ドラフトはまだ生成されていません。Repository タブでスナップショットを作成し、下のボタンでドラフトを生成してください。")
         snapshot = api_get("/repository/snapshots/latest")

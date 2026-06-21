@@ -1,7 +1,7 @@
 """Draft generation for System Profile and Feature Map.
 
 Uses the LLM layer to produce evidence-backed drafts from committed repository
-content.  Falls back to deterministic mock fixtures when LLM_PROVIDER=mock.
+content. Deterministic mock fixtures are available only when LLM_PROVIDER=mock.
 """
 
 from __future__ import annotations
@@ -59,15 +59,24 @@ class GenerationResult:
     error: Optional[str] = None
 
 
-def _build_file_context(files: List[IndexedFile], max_chars: int = 200_000) -> str:
+class DraftValidationError(ValueError):
+    pass
+
+
+def _build_file_context(
+    files: List[IndexedFile], max_chars: int = 200_000
+) -> Tuple[str, List[IndexedFile]]:
     sections: Dict[str, List[IndexedFile]] = {}
     for f in files:
         sections.setdefault(f.source_type, []).append(f)
 
     parts = []
+    selected = []
     total = 0
     for source_type in ["documentation", "source", "test", "configuration"]:
         for f in sections.get(source_type, []):
+            if b"\x00" in f.content:
+                continue
             try:
                 text = f.content.decode("utf-8", errors="replace")
             except Exception:
@@ -75,9 +84,13 @@ def _build_file_context(files: List[IndexedFile], max_chars: int = 200_000) -> s
             if total + len(text) > max_chars:
                 continue
             total += len(text)
-            parts.append(f"### File: {f.path} (type: {source_type})\n```\n{text}\n```")
+            selected.append(f)
+            parts.append(
+                f"### File: {f.path} (type: {source_type})\n"
+                f"<repository_file>\n{text}\n</repository_file>"
+            )
 
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), selected
 
 
 _SYSTEM_PROMPT = """\
@@ -124,71 +137,109 @@ Repository contents:
 {file_context}"""
 
 
-def _parse_evidence(raw: Any) -> List[EvidenceItem]:
+def _parse_evidence(raw: Any, line_counts: Dict[str, int]) -> List[EvidenceItem]:
     if not isinstance(raw, list):
-        return []
+        raise DraftValidationError("evidence must be an array")
     items = []
     for e in raw:
         if not isinstance(e, dict):
-            continue
-        path = e.get("path", "")
+            raise DraftValidationError("evidence items must be objects")
+        path = str(e.get("path", ""))
         if not path:
-            continue
-        items.append(EvidenceItem(
-            path=str(path),
-            start_line=int(e.get("start_line", 0)),
-            end_line=int(e.get("end_line", 0)),
-            summary=str(e.get("summary", "")),
-        ))
+            raise DraftValidationError("evidence path is required")
+        if path not in line_counts:
+            raise DraftValidationError(f"evidence path is not in snapshot: {path}")
+        try:
+            start_line = int(e.get("start_line"))
+            end_line = int(e.get("end_line"))
+        except (TypeError, ValueError) as exc:
+            raise DraftValidationError(
+                f"evidence line range must be integers: {path}"
+            ) from exc
+        if start_line < 1 or end_line < start_line:
+            raise DraftValidationError(f"invalid evidence line range: {path}")
+        if end_line > line_counts[path]:
+            raise DraftValidationError(
+                f"evidence line range exceeds snapshot content: {path}"
+            )
+        summary = str(e.get("summary", "")).strip()
+        if not summary:
+            raise DraftValidationError(f"evidence summary is required: {path}")
+        items.append(
+            EvidenceItem(
+                path=path,
+                start_line=start_line,
+                end_line=end_line,
+                summary=summary,
+            )
+        )
+    if not items:
+        raise DraftValidationError("at least one evidence item is required")
     return items
 
 
-def _validate_evidence(
-    evidence: List[EvidenceItem], file_paths: set
-) -> List[EvidenceItem]:
-    return [e for e in evidence if e.path in file_paths]
+def _required_text(value: Any, field_name: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise DraftValidationError(f"{field_name} is required")
+    return text
+
+
+def _string_list(value: Any, field_name: str) -> List[str]:
+    if not isinstance(value, list):
+        raise DraftValidationError(f"{field_name} must be an array")
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def _parse_draft_response(
-    raw_json: str, file_paths: set
+    raw_json: str, line_counts: Dict[str, int]
 ) -> Tuple[Optional[SystemProfileDraft], List[FeatureDraft]]:
     data = json.loads(raw_json)
+    if not isinstance(data, dict):
+        raise DraftValidationError("LLM response must be an object")
 
     sp_data = data.get("system_profile")
-    sp_draft = None
-    if isinstance(sp_data, dict):
-        evidence = _validate_evidence(
-            _parse_evidence(sp_data.get("evidence")), file_paths
-        )
-        sp_draft = SystemProfileDraft(
-            name=str(sp_data.get("name", "")),
-            purpose=str(sp_data.get("purpose", "")),
-            target_users=[str(u) for u in sp_data.get("target_users", []) if u],
-            stakeholder_value=str(sp_data.get("stakeholder_value", "")),
-            constraints=[str(c) for c in sp_data.get("constraints", []) if c],
-            success_criteria=[str(s) for s in sp_data.get("success_criteria", []) if s],
-            evidence=evidence,
-        )
+    if not isinstance(sp_data, dict):
+        raise DraftValidationError("system_profile must be an object")
+    sp_draft = SystemProfileDraft(
+        name=_required_text(sp_data.get("name"), "system_profile.name"),
+        purpose=_required_text(sp_data.get("purpose"), "system_profile.purpose"),
+        target_users=_string_list(
+            sp_data.get("target_users"), "system_profile.target_users"
+        ),
+        stakeholder_value=_required_text(
+            sp_data.get("stakeholder_value"), "system_profile.stakeholder_value"
+        ),
+        constraints=_string_list(
+            sp_data.get("constraints"), "system_profile.constraints"
+        ),
+        success_criteria=_string_list(
+            sp_data.get("success_criteria"), "system_profile.success_criteria"
+        ),
+        evidence=_parse_evidence(sp_data.get("evidence"), line_counts),
+    )
 
     features_data = data.get("features", [])
+    if not isinstance(features_data, list) or not features_data:
+        raise DraftValidationError("features must be a non-empty array")
     features = []
-    if isinstance(features_data, list):
-        for fd in features_data:
-            if not isinstance(fd, dict):
-                continue
-            evidence = _validate_evidence(
-                _parse_evidence(fd.get("evidence")), file_paths
-            )
-            features.append(FeatureDraft(
-                feature_id=str(fd.get("feature_id", "")),
-                name=str(fd.get("name", "")),
-                summary=str(fd.get("summary", "")),
-                user_value=str(fd.get("user_value", "")),
-                success_criteria=[str(s) for s in fd.get("success_criteria", []) if s],
-                risks=[str(r) for r in fd.get("risks", []) if r],
-                evidence=evidence,
+    for fd in features_data:
+        if not isinstance(fd, dict):
+            raise DraftValidationError("feature items must be objects")
+        features.append(
+            FeatureDraft(
+                feature_id=_required_text(fd.get("feature_id"), "feature_id"),
+                name=_required_text(fd.get("name"), "feature.name"),
+                summary=_required_text(fd.get("summary"), "feature.summary"),
+                user_value=_required_text(fd.get("user_value"), "feature.user_value"),
+                success_criteria=_string_list(
+                    fd.get("success_criteria"), "feature.success_criteria"
+                ),
+                risks=_string_list(fd.get("risks"), "feature.risks"),
+                evidence=_parse_evidence(fd.get("evidence"), line_counts),
                 decision_method="reasoning_llm",
-            ))
+            )
+        )
 
     return sp_draft, features
 
@@ -256,8 +307,6 @@ def generate_drafts(
     files: List[IndexedFile],
 ) -> GenerationResult:
     is_mock = isinstance(client, MockLLMClient)
-    file_paths = {f.path for f in files}
-
     if is_mock:
         sp, features = _mock_drafts(files)
         return GenerationResult(
@@ -268,7 +317,16 @@ def generate_drafts(
             features=features,
         )
 
-    file_context = _build_file_context(files)
+    file_context, context_files = _build_file_context(files)
+    if not file_context:
+        return GenerationResult(
+            provider=config.provider,
+            model=config.model,
+            is_mock=False,
+            system_profile=None,
+            features=[],
+            error="Snapshot contains no readable text content",
+        )
     prompt = _DRAFT_PROMPT_TEMPLATE.format(file_context=file_context)
 
     try:
@@ -298,8 +356,12 @@ def generate_drafts(
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             cleaned = "\n".join(lines)
-        sp, features = _parse_draft_response(cleaned, file_paths)
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        line_counts = {
+            file.path: max(1, len(file.content.decode("utf-8", errors="replace").splitlines()))
+            for file in context_files
+        }
+        sp, features = _parse_draft_response(cleaned, line_counts)
+    except (json.JSONDecodeError, DraftValidationError, KeyError, TypeError) as exc:
         return GenerationResult(
             provider=config.provider,
             model=config.model,

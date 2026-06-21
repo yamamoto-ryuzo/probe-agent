@@ -60,7 +60,7 @@
         "id": { "type": "integer" },
         "system_id": { "type": "integer" },
         "snapshot_id": { "type": "integer" },
-        "run_type": { "enum": ["system_profile_draft", "feature_map_draft"] },
+        "run_type": { "enum": ["repository_drafts", "system_profile_draft", "feature_map_draft"] },
         "provider": { "type": "string" },
         "model": { "type": "string" },
         "prompt_version": { "type": "string" },

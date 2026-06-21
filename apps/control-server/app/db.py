@@ -241,6 +241,7 @@ CREATE TABLE IF NOT EXISTS snapshot_files (
     source_type     TEXT NOT NULL,
     size_bytes      INTEGER NOT NULL DEFAULT 0,
     content_hash    TEXT,
+    content         BLOB NOT NULL DEFAULT X'',
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
 );
 
@@ -490,6 +491,10 @@ def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        if "content" not in _columns(conn, "snapshot_files"):
+            conn.execute(
+                "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"
+            )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 
