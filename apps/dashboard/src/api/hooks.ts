@@ -172,7 +172,7 @@ export function useRepositoryConfig() {
 export function useUpdateRepositoryConfig() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { repo_path: string; include_patterns?: string; exclude_patterns?: string }) =>
+    mutationFn: (data: { repo_path: string; include_patterns?: string[]; exclude_patterns?: string[] }) =>
       api.put<RepositoryConfigOut>("/repository", data),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("repoConfig") }),
   });

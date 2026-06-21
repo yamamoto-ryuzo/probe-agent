@@ -86,8 +86,8 @@ export interface MeResponse {
 export interface RepositoryConfigOut {
   system_id: number;
   repo_path: string;
-  include_patterns: string;
-  exclude_patterns: string;
+  include_patterns: string[];
+  exclude_patterns: string[];
   created_at: string;
   updated_at: string;
 }

@@ -35,6 +35,8 @@ services:
       context: ./apps/dashboard
     image: probe-agent/dashboard:latest
     container_name: probe-dashboard
+    environment:
+      PROBE_CLIENT_SERVER_URL: ${PROBE_CLIENT_SERVER_URL:-http://localhost:8000}
     ports:
       - "8501:8501"
     depends_on:

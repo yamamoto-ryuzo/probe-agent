@@ -15,6 +15,14 @@ import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw } from "lucide-react";
 
+function patternsToText(patterns: string[] | undefined): string {
+  return (patterns ?? []).join("\n");
+}
+
+function textToPatterns(text: string): string[] {
+  return text.split("\n").map(l => l.trim()).filter(Boolean);
+}
+
 export default function RepositoryPage() {
   const { data: config, isLoading: configLoading } = useRepositoryConfig();
   const updateConfig = useUpdateRepositoryConfig();
@@ -30,8 +38,8 @@ export default function RepositoryPage() {
 
   if (config && !configInit) {
     setRepoPath(config.repo_path || "");
-    setIncludePatterns(config.include_patterns || "");
-    setExcludePatterns(config.exclude_patterns || "");
+    setIncludePatterns(patternsToText(config.include_patterns));
+    setExcludePatterns(patternsToText(config.exclude_patterns));
     setConfigInit(true);
   }
 
@@ -39,8 +47,8 @@ export default function RepositoryPage() {
     try {
       await updateConfig.mutateAsync({
         repo_path: repoPath,
-        include_patterns: includePatterns,
-        exclude_patterns: excludePatterns,
+        include_patterns: textToPatterns(includePatterns),
+        exclude_patterns: textToPatterns(excludePatterns),
       });
       toast.success("Repository config saved");
     } catch (err) { toast.error(String(err)); }
@@ -73,12 +81,12 @@ export default function RepositoryPage() {
                     <Input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="/path/to/repo" />
                   </div>
                   <div className="space-y-2">
-                    <Label>Include Patterns</Label>
-                    <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder="*.py&#10;*.js" rows={3} />
+                    <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+                    <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
                   </div>
                   <div className="space-y-2">
-                    <Label>Exclude Patterns</Label>
-                    <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder="test_*&#10;__pycache__" rows={3} />
+                    <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+                    <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
                   </div>
                   <Button onClick={saveConfig} disabled={updateConfig.isPending}>
                     {updateConfig.isPending ? "Saving..." : "Save Configuration"}

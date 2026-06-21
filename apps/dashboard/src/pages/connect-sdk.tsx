@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Copy, Key, Trash2 } from "lucide-react";
+import { getClientServerUrl } from "@/lib/env";
 
 export default function ConnectSdkPage() {
   const { systemId } = useAuth();
@@ -34,7 +35,7 @@ export default function ConnectSdkPage() {
     } catch (err) { toast.error(String(err)); }
   };
 
-  const serverUrl = window.location.origin;
+  const serverUrl = getClientServerUrl();
 
   return (
     <div className="space-y-6">
