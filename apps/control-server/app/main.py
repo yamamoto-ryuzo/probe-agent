@@ -4,7 +4,16 @@ from fastapi import Depends, FastAPI
 
 from .auth import get_principal
 from .db import init_db
-from .routes import auth, components, evaluation, generation, shadow, systems, traces
+from .routes import (
+    auth,
+    components,
+    evaluation,
+    generation,
+    project_intelligence,
+    shadow,
+    systems,
+    traces,
+)
 
 _auth = [Depends(get_principal)]
 
@@ -31,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(shadow.router, dependencies=_auth)
     app.include_router(evaluation.router, dependencies=_auth)
     app.include_router(generation.router, dependencies=_auth)
+    app.include_router(project_intelligence.router, dependencies=_auth)
     return app
 
 

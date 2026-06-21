@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://probe-agent.dev/schemas/project_intelligence.json",
+  "title": "ProjectIntelligence",
+  "type": "object",
+  "required": ["system_id", "mock", "reasoning_model_required", "deterministic_decision_policy", "repository", "system_profile_draft", "features", "probe_plans", "experiments"],
+  "properties": {
+    "system_id": { "type": "integer" },
+    "mock": { "type": "boolean" },
+    "reasoning_model_required": { "const": true },
+    "deterministic_decision_policy": { "type": "string" },
+    "repository": {
+      "type": "object",
+      "required": ["repo_path", "commit_sha", "included_paths", "excluded_paths", "read_policy", "status"],
+      "properties": {
+        "repo_path": { "type": "string" },
+        "commit_sha": { "type": "string" },
+        "included_paths": { "type": "array", "items": { "type": "string" } },
+        "excluded_paths": { "type": "array", "items": { "type": "string" } },
+        "read_policy": { "const": "committed_files_only" },
+        "status": { "enum": ["not_configured", "ready", "indexing", "failed"] }
+      },
+      "additionalProperties": false
+    },
+    "system_profile_draft": { "type": "object" },
+    "features": { "type": "array", "items": { "type": "object" } },
+    "probe_plans": { "type": "array", "items": { "type": "object" } },
+    "experiments": { "type": "array", "items": { "type": "object" } }
+  },
+  "additionalProperties": false
+}

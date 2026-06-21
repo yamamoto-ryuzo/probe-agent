@@ -58,3 +58,17 @@ shadow スレッドを join する。
 - candidate を `set_candidate` 以外（プラグインや別プロセス）から登録する経路
 - LLM ベースの自動評価
 - CI 上で shadow をまとめて回すためのバッチランナー
+
+## Feature Intelligence / Experiment Workspace
+
+`Component` の上位概念として `Feature` を導入する。Feature はユーザー価値、
+成功条件、risk、repository evidence、関連 code symbol を持つ。
+
+対象 repo は filesystem から直接読まず、特定 commit の tracked file を
+`git show` で読む。probe と source patch は対象 repo へ直接適用せず、一時
+worktree で baseline と比較する。詳細は
+[`project-intelligence.md`](project-intelligence.md) を参照。
+
+決定的ルールは、少数の明示的な有限集合に閉じる分類・検証に限定する。
+Feature 抽出、code mapping、probe planning、experiment interpretation は
+reasoning model の LLM API を必須とし、heuristic fallback は行わない。

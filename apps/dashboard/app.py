@@ -1138,6 +1138,96 @@ def render_system_settings(system: Dict[str, Any]) -> None:
             st.rerun()
 
 
+def _project_intelligence() -> Dict[str, Any]:
+    return api_get("/project-intelligence") or {}
+
+
+def _render_mock_notice(data: Dict[str, Any]) -> None:
+    if data.get("mock"):
+        st.warning(
+            "この画面は契約確認用Mockです。Git snapshot、解析、保存、patch実行はまだ行いません。"
+        )
+    if data.get("reasoning_model_required"):
+        st.caption(
+            "判断方針: 少数の明示的な有限集合への分類だけ決定的ルールを許可し、"
+            "自由度のある推論は reasoning model のLLM APIを必須とします。"
+        )
+
+
+def render_repository_tab(_system: Dict[str, Any]) -> None:
+    st.subheader("Repository")
+    data = _project_intelligence()
+    _render_mock_notice(data)
+    repository = data.get("repository") or {}
+    cols = st.columns(3)
+    cols[0].metric("Status", repository.get("status", "-"))
+    cols[1].metric("Read policy", repository.get("read_policy", "-"))
+    cols[2].metric("Commit", (repository.get("commit_sha") or "-")[:12])
+    st.text_input("Repository path", value=repository.get("repo_path", ""), disabled=True)
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Included paths**")
+        for path in repository.get("included_paths", []):
+            st.code(path)
+    with right:
+        st.markdown("**Excluded paths**")
+        for path in repository.get("excluded_paths", []):
+            st.code(path)
+    st.button("Create snapshot", disabled=True, help="後続Issueで実装します")
+
+
+def render_feature_map_tab(_system: Dict[str, Any]) -> None:
+    st.subheader("Feature Map")
+    data = _project_intelligence()
+    _render_mock_notice(data)
+    for feature in data.get("features", []):
+        with st.expander(f"{feature['name']} · {feature['feature_id']}", expanded=True):
+            st.write(feature.get("summary", ""))
+            st.markdown(f"**User value:** {feature.get('user_value', '')}")
+            st.markdown("**Success criteria**")
+            for criterion in feature.get("success_criteria", []):
+                st.write(f"- {criterion}")
+            st.markdown("**Evidence**")
+            for evidence in feature.get("evidence", []):
+                st.write(
+                    f"- `{evidence['path']}` ({evidence['lines']}): "
+                    f"{evidence.get('summary', '')}"
+                )
+            if feature.get("code_links"):
+                st.markdown("**Code links**")
+                st.dataframe(feature["code_links"], use_container_width=True)
+
+
+def render_probe_planner_tab(_system: Dict[str, Any]) -> None:
+    st.subheader("Probe Planner")
+    data = _project_intelligence()
+    _render_mock_notice(data)
+    for plan in data.get("probe_plans", []):
+        st.markdown(f"### {plan['feature_id']}")
+        st.write(plan.get("objective", ""))
+        st.dataframe(plan.get("probe_points", []), use_container_width=True)
+        if plan.get("avoid_probe_points"):
+            st.markdown("**Avoid**")
+            for point in plan["avoid_probe_points"]:
+                st.write(f"- {point}")
+    st.button("Generate temporary probe patch", disabled=True, help="後続Issueで実装します")
+
+
+def render_experiments_tab(_system: Dict[str, Any]) -> None:
+    st.subheader("Experiments")
+    data = _project_intelligence()
+    _render_mock_notice(data)
+    for experiment in data.get("experiments", []):
+        with st.expander(
+            f"{experiment['experiment_id']} · {experiment['status']}", expanded=True
+        ):
+            st.write(experiment.get("objective", ""))
+            st.caption(f"baseline commit: {experiment.get('baseline_commit', '-')}")
+            st.dataframe(experiment.get("variants", []), use_container_width=True)
+            st.markdown("**Metrics:** " + ", ".join(experiment.get("metrics", [])))
+    st.button("Run experiment", disabled=True, help="後続Issueで実装します")
+
+
 def render_system_selector(
     systems: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
@@ -1234,7 +1324,17 @@ st.caption(
     f"Last seen: {fmt_ts(selected_system.get('last_seen'))}"
 )
 
-tab_labels = ["Overview", "Connect SDK", "Generate & Evaluate", "Components", "Settings"]
+tab_labels = [
+    "Overview",
+    "Repository",
+    "Feature Map",
+    "Probe Planner",
+    "Experiments",
+    "Connect SDK",
+    "Generate & Evaluate",
+    "Components",
+    "Settings",
+]
 if is_admin:
     tab_labels.append("User Management")
 tabs = st.tabs(tab_labels)
@@ -1242,12 +1342,20 @@ tabs = st.tabs(tab_labels)
 with tabs[0]:
     render_overview_tab(selected_system)
 with tabs[1]:
-    render_connect_sdk_tab(selected_system)
+    render_repository_tab(selected_system)
 with tabs[2]:
-    render_generate_evaluate_tab(selected_system)
+    render_feature_map_tab(selected_system)
 with tabs[3]:
-    render_components_tab(selected_system)
+    render_probe_planner_tab(selected_system)
 with tabs[4]:
+    render_experiments_tab(selected_system)
+with tabs[5]:
+    render_connect_sdk_tab(selected_system)
+with tabs[6]:
+    render_generate_evaluate_tab(selected_system)
+with tabs[7]:
+    render_components_tab(selected_system)
+with tabs[8]:
     render_system_settings(selected_system)
 if is_admin:
     with tabs[tab_labels.index("User Management")]:

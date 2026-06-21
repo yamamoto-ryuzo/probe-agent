@@ -193,6 +193,90 @@ class GenerationRun(BaseModel):
     created_at: float
 
 
+class RepositorySnapshot(BaseModel):
+    repo_path: str
+    commit_sha: str
+    included_paths: List[str] = Field(default_factory=list)
+    excluded_paths: List[str] = Field(default_factory=list)
+    read_policy: Literal["committed_files_only"] = "committed_files_only"
+    status: Literal["not_configured", "ready", "indexing", "failed"] = "not_configured"
+
+
+class FeatureEvidence(BaseModel):
+    path: str
+    lines: str
+    summary: str = ""
+
+
+class FeatureCodeLink(BaseModel):
+    path: str
+    symbol: str
+    kind: str = "function"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
+
+
+class FeatureProfile(BaseModel):
+    feature_id: str
+    name: str
+    summary: str
+    user_value: str
+    success_criteria: List[str] = Field(default_factory=list)
+    risks: List[str] = Field(default_factory=list)
+    evidence: List[FeatureEvidence] = Field(default_factory=list)
+    code_links: List[FeatureCodeLink] = Field(default_factory=list)
+    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
+
+
+class ProbePoint(BaseModel):
+    component_id: str
+    feature_id: str
+    path: str
+    symbol: str
+    reason: str
+    recommended_mode: Mode = "trace"
+    side_effect_risk: Literal["low", "medium", "high"] = "low"
+    status: Literal["proposed", "approved", "rejected"] = "proposed"
+
+
+class ProbePlan(BaseModel):
+    feature_id: str
+    objective: str
+    probe_points: List[ProbePoint] = Field(default_factory=list)
+    avoid_probe_points: List[str] = Field(default_factory=list)
+    decision_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
+
+
+class ExperimentVariant(BaseModel):
+    variant_id: str
+    label: str
+    status: Literal["planned", "running", "completed", "failed"] = "planned"
+    patch_summary: Optional[str] = None
+
+
+class ExperimentSummary(BaseModel):
+    experiment_id: str
+    feature_id: str
+    objective: str
+    baseline_commit: str
+    status: Literal["draft", "running", "completed", "failed"] = "draft"
+    variants: List[ExperimentVariant] = Field(default_factory=list)
+    metrics: List[str] = Field(default_factory=list)
+    interpretation_method: Literal["deterministic", "reasoning_llm", "manual"] = "manual"
+
+
+class ProjectIntelligenceMock(BaseModel):
+    system_id: int
+    mock: bool = True
+    reasoning_model_required: bool = True
+    deterministic_decision_policy: str
+    repository: RepositorySnapshot
+    system_profile_draft: SystemProfile
+    features: List[FeatureProfile] = Field(default_factory=list)
+    probe_plans: List[ProbePlan] = Field(default_factory=list)
+    experiments: List[ExperimentSummary] = Field(default_factory=list)
+
+
 Role = Literal["admin", "user"]
 TokenKind = Literal["session", "api"]
 

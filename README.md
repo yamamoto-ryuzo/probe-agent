@@ -3,6 +3,11 @@
 開発対象システムの任意のコンポーネントに `@probe` を付け、入出力をトレース・可視化し、
 代替実装と shadow 比較するための最小ツールキット。
 
+今後は、関数単位の `Component` の上にユーザー価値単位の `Feature` を置く
+**Feature Intelligence Layer** と、source patch を隔離環境で比較する
+**Experiment Workspace Layer** を追加する。設計と現在の Mock は
+[`docs/project-intelligence.md`](docs/project-intelligence.md) を参照。
+
 詳細は [issue #1](https://github.com/dx-junkyard/probe-agent/issues/1) と
 [`docs/mvp.md`](docs/mvp.md) を参照。
 
@@ -18,8 +23,29 @@ probe-agent/
 ├── examples/
 │   └── simple-pipeline/  # @probe を付けたサンプル
 ├── shared/schemas/       # JSON Schema 定義
+├── probe-agent.example.yml # 対象repoの読み取り・実行設定例
 └── docs/
 ```
+
+## Feature Intelligence Layer（Mock）
+
+Control Server の `GET /project-intelligence` は、次の将来データモデルを
+代表データとして返す。
+
+- committed files only の `RepositorySnapshot`
+- evidence 付きの `SystemProfile` / `FeatureProfile`
+- Feature と source symbol を結ぶ `FeatureCodeLink`
+- 副作用リスクを持つ `ProbePlan`
+- baseline と source patch variant を比較する `ExperimentSummary`
+
+Dashboard には `Repository` / `Feature Map` / `Probe Planner` / `Experiments`
+タブを追加している。現時点では明示的な Mock であり、対象 repo の読み取り、
+コード変更、worktree 作成、コマンド実行は行わない。
+
+判断ロジックは、少数の明示的な有限集合への分類だけ決定的ルールを許可する。
+Feature 抽出、Feature-to-Code mapping、Probe Plan、実験結果の解釈など自由度の
+ある推論には reasoning model の LLM API を必須とし、失敗時に heuristic へ
+フォールバックしない。
 
 ## クイックスタート (Docker Compose)
 
