@@ -1,0 +1,385 @@
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api, getSystemId } from "./client";
+import type {
+  SystemOut, ComponentSummary, TraceEvent, Policy,
+  ShadowResult, ComponentProfile, UserOut, TokenOut,
+  RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
+  SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut,
+  ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
+  EvaluationCriterion,
+  SystemProfile,
+} from "./types";
+
+function sysKey(base: string) {
+  return [base, getSystemId()];
+}
+
+export function useMe() {
+  return useQuery({
+    queryKey: ["me"],
+    queryFn: () => api.get<MeResponse>("/auth/me"),
+    retry: false,
+    staleTime: 60_000,
+  });
+}
+
+export function useSystems() {
+  return useQuery({
+    queryKey: ["systems"],
+    queryFn: () => api.get<SystemOut[]>("/systems"),
+  });
+}
+
+export function useCreateSystem() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { name: string; environment?: string; description?: string }) =>
+      api.post<SystemOut>("/systems", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["systems"] }),
+  });
+}
+
+export function useUpdateSystem() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: number; name: string; environment?: string; description?: string }) =>
+      api.put<SystemOut>(`/systems/${id}`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["systems"] }),
+  });
+}
+
+export function useComponents() {
+  return useQuery({
+    queryKey: sysKey("components"),
+    queryFn: () => api.get<ComponentSummary[]>("/components"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useTraces(componentId: string | null, limit = 50) {
+  return useQuery({
+    queryKey: [...sysKey("traces"), componentId, limit],
+    queryFn: () => api.get<TraceEvent[]>(`/components/${componentId}/traces?limit=${limit}`),
+    enabled: !!componentId && !!getSystemId(),
+  });
+}
+
+export function useUpdatePolicy() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ componentId, mode }: { componentId: string; mode: string }) =>
+      api.put<Policy>(`/components/${componentId}/policy`, { mode }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("components") }),
+  });
+}
+
+export function useShadowResults(componentId: string | null, limit = 50) {
+  return useQuery({
+    queryKey: [...sysKey("shadow"), componentId, limit],
+    queryFn: () => api.get<ShadowResult[]>(`/components/${componentId}/shadow-results?limit=${limit}`),
+    enabled: !!componentId && !!getSystemId(),
+  });
+}
+
+export function useUpdateEvaluation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ resultId, evaluation }: { resultId: number; evaluation: string }) =>
+      api.put(`/shadow-results/${resultId}/evaluation`, { evaluation }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("shadow") }),
+  });
+}
+
+export function useComponentProfile(componentId: string | null) {
+  return useQuery({
+    queryKey: [...sysKey("profile"), componentId],
+    queryFn: () => api.get<ComponentProfile>(`/components/${componentId}/profile`),
+    enabled: !!componentId && !!getSystemId(),
+  });
+}
+
+export function useUpdateComponentProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: ComponentProfile) =>
+      api.put<ComponentProfile>(`/components/${data.component_id}/profile`, data),
+    onSuccess: (_d, v) => qc.invalidateQueries({ queryKey: [...sysKey("profile"), v.component_id] }),
+  });
+}
+
+export function useSystemProfile() {
+  return useQuery({
+    queryKey: sysKey("system-profile"),
+    queryFn: () => api.get<SystemProfile>("/system-profile"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCriteria(componentId: string | null) {
+  return useQuery({
+    queryKey: [...sysKey("criteria"), componentId],
+    queryFn: () => api.get<EvaluationCriterion[]>(`/components/${componentId}/criteria`),
+    enabled: !!componentId && !!getSystemId(),
+  });
+}
+
+export function useUsers() {
+  return useQuery({ queryKey: ["users"], queryFn: () => api.get<UserOut[]>("/users") });
+}
+
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { username: string; password: string; role?: string }) =>
+      api.post<UserOut>("/users", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
+  });
+}
+
+export function useMyTokens() {
+  return useQuery({ queryKey: ["myTokens"], queryFn: () => api.get<TokenOut[]>("/tokens/me") });
+}
+
+export function useIssueToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { name: string; system_id: number; expires_in_days?: number }) =>
+      api.post<TokenOut>("/tokens/me", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["myTokens"] }),
+  });
+}
+
+export function useRevokeMyToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (tokenId: number) => api.post(`/tokens/me/${tokenId}/revoke`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["myTokens"] }),
+  });
+}
+
+export function useAllTokens() {
+  return useQuery({ queryKey: ["allTokens"], queryFn: () => api.get<TokenOut[]>("/tokens") });
+}
+
+export function useRepositoryConfig() {
+  return useQuery({
+    queryKey: sysKey("repoConfig"),
+    queryFn: () => api.get<RepositoryConfigOut | null>("/repository"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useUpdateRepositoryConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { repo_path: string; include_patterns?: string; exclude_patterns?: string }) =>
+      api.put<RepositoryConfigOut>("/repository", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("repoConfig") }),
+  });
+}
+
+export function useSnapshots() {
+  return useQuery({
+    queryKey: sysKey("snapshots"),
+    queryFn: () => api.get<SnapshotOut[]>("/repository/snapshots"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useLatestSnapshot() {
+  return useQuery({
+    queryKey: sysKey("latestSnapshot"),
+    queryFn: () => api.get<SnapshotOut | null>("/repository/snapshots/latest"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateSnapshot() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<SnapshotOut>("/repository/snapshots"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("snapshots") });
+      qc.invalidateQueries({ queryKey: sysKey("latestSnapshot") });
+    },
+  });
+}
+
+export function useLatestDrafts() {
+  return useQuery({
+    queryKey: sysKey("drafts"),
+    queryFn: () => api.get<LatestDraftsOut>("/repository/drafts/latest"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGenerateDrafts() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post("/repository/drafts/generate"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("drafts") }),
+  });
+}
+
+export function useSymbols() {
+  return useQuery({
+    queryKey: sysKey("symbols"),
+    queryFn: () => api.get<SymbolIndexOut>("/repository/symbols"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useIndexSymbols() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<SymbolIndexOut>("/repository/symbols/index"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("symbols") }),
+  });
+}
+
+export function useCodeLinks() {
+  return useQuery({
+    queryKey: sysKey("codeLinks"),
+    queryFn: () => api.get<FeatureCodeLinksOut>("/repository/code-links"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGenerateCodeLinks() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post("/repository/code-links/generate"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
+  });
+}
+
+export function useReviewCodeLink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ linkId, review_status }: { linkId: number; review_status: string }) =>
+      api.put(`/repository/code-links/${linkId}/review`, { review_status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("codeLinks") }),
+  });
+}
+
+export function useProbePlans() {
+  return useQuery({
+    queryKey: sysKey("probePlans"),
+    queryFn: () => api.get<ProbePlansListOut>("/repository/probe-plans"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGenerateProbePlan() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post("/repository/probe-plans/generate"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
+  });
+}
+
+export function useUpdateProbePointStatus() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ pointId, status }: { pointId: number; status: string }) =>
+      api.put(`/repository/probe-points/${pointId}/status`, { status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
+  });
+}
+
+export function useProbePatches() {
+  return useQuery({
+    queryKey: sysKey("probePatches"),
+    queryFn: () => api.get<ProbePatchOut[]>("/repository/probe-patches"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useGeneratePatch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (planId: number) => api.post<ProbePatchOut>(`/repository/probe-plans/${planId}/patch`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePatches") }),
+  });
+}
+
+export function useValidatePatch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (patchId: number) => api.post<ProbePatchOut>(`/repository/probe-patches/${patchId}/validate`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePatches") }),
+  });
+}
+
+export function useGenerationRuns(componentId?: string, limit = 20) {
+  const params = new URLSearchParams();
+  if (componentId) params.set("component_id", componentId);
+  params.set("limit", String(limit));
+  return useQuery({
+    queryKey: [...sysKey("generationRuns"), componentId, limit],
+    queryFn: () => api.get<GenerationRun[]>(`/generation-runs?${params}`),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useCreateGenerationRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { component_id: string; trace_id: string; objective: string }) =>
+      api.post<GenerationRun>("/generation-runs", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("generationRuns") }),
+  });
+}
+
+export function useExperiments() {
+  return useQuery({
+    queryKey: sysKey("experiments"),
+    queryFn: () => api.get<ExperimentOut[]>("/experiments"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useExperiment(id: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("experiment"), id],
+    queryFn: () => api.get<ExperimentOut>(`/experiments/${id}`),
+    enabled: !!id && !!getSystemId(),
+  });
+}
+
+export function useCreateExperiment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (data: { feature_id: string; objective: string; snapshot_id: number; variants: { label: string; patch_text: string }[] }) =>
+      api.post<ExperimentOut>("/experiments", data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
+  });
+}
+
+export function useRunExperiment() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.post<ExperimentOut>(`/experiments/${id}/run`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
+  });
+}
+
+export function useExperimentDecision() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, ...data }: { id: number; decision: string; variant_key?: string; note?: string }) =>
+      api.put<ExperimentOut>(`/experiments/${id}/decision`, data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
+  });
+}
+
+export function useLogin() {
+  return useMutation({
+    mutationFn: (data: { username: string; password: string }) =>
+      api.post<{ access_token: string; token_type: string; expires_at: string }>("/auth/login", data),
+  });
+}
+
+export function useLogout() {
+  return useMutation({ mutationFn: () => api.post("/auth/logout") });
+}
