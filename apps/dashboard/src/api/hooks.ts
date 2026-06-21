@@ -350,7 +350,7 @@ export function useExperiment(id: number | null) {
 export function useCreateExperiment() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (data: { feature_id: string; objective: string; snapshot_id: number; variants: { label: string; patch_text: string }[] }) =>
+    mutationFn: (data: { feature_id: string; objective: string; snapshot_id: number; variants: { label: string; patch_text: string; risk_note?: string }[] }) =>
       api.post<ExperimentOut>("/experiments", data),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("experiments") }),
   });

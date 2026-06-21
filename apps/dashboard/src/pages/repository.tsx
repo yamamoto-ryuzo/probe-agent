@@ -3,6 +3,7 @@ import {
   useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useCreateSnapshot, useSymbols, useIndexSymbols,
 } from "@/api/hooks";
+import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,6 +15,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw } from "lucide-react";
+import type { RepositoryConfigOut } from "@/api/types";
 
 function patternsToText(patterns: string[] | undefined): string {
   return (patterns ?? []).join("\n");
@@ -24,6 +26,7 @@ function textToPatterns(text: string): string[] {
 }
 
 export default function RepositoryPage() {
+  const { systemId } = useAuth();
   const { data: config, isLoading: configLoading } = useRepositoryConfig();
   const updateConfig = useUpdateRepositoryConfig();
   const { data: snapshots, isLoading: snapsLoading } = useSnapshots();
@@ -31,28 +34,7 @@ export default function RepositoryPage() {
   const { data: symbolIndex, isLoading: symLoading } = useSymbols();
   const indexSymbols = useIndexSymbols();
 
-  const [repoPath, setRepoPath] = useState("");
-  const [includePatterns, setIncludePatterns] = useState("");
-  const [excludePatterns, setExcludePatterns] = useState("");
-  const [configInit, setConfigInit] = useState(false);
-
-  if (config && !configInit) {
-    setRepoPath(config.repo_path || "");
-    setIncludePatterns(patternsToText(config.include_patterns));
-    setExcludePatterns(patternsToText(config.exclude_patterns));
-    setConfigInit(true);
-  }
-
-  const saveConfig = async () => {
-    try {
-      await updateConfig.mutateAsync({
-        repo_path: repoPath,
-        include_patterns: textToPatterns(includePatterns),
-        exclude_patterns: textToPatterns(excludePatterns),
-      });
-      toast.success("Repository config saved");
-    } catch (err) { toast.error(String(err)); }
-  };
+  const configKey = systemId != null ? `${systemId}-${config?.repo_path ?? ""}` : "empty";
 
   return (
     <div className="space-y-6">
@@ -75,23 +57,15 @@ export default function RepositoryPage() {
               {configLoading ? (
                 <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
               ) : (
-                <>
-                  <div className="space-y-2">
-                    <Label>Repository Path</Label>
-                    <Input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="/path/to/repo" />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-                    <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
-                    <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
-                  </div>
-                  <Button onClick={saveConfig} disabled={updateConfig.isPending}>
-                    {updateConfig.isPending ? "Saving..." : "Save Configuration"}
-                  </Button>
-                </>
+                <RepoConfigForm
+                  key={configKey}
+                  config={config ?? null}
+                  onSave={async (data) => {
+                    await updateConfig.mutateAsync(data);
+                    toast.success("Repository config saved");
+                  }}
+                  isPending={updateConfig.isPending}
+                />
               )}
             </CardContent>
           </Card>
@@ -196,5 +170,45 @@ export default function RepositoryPage() {
         </TabsContent>
       </Tabs>
     </div>
+  );
+}
+
+function RepoConfigForm({ config, onSave, isPending }: {
+  config: RepositoryConfigOut | null;
+  onSave: (data: { repo_path: string; include_patterns: string[]; exclude_patterns: string[] }) => Promise<void>;
+  isPending: boolean;
+}) {
+  const [repoPath, setRepoPath] = useState(config?.repo_path ?? "");
+  const [includePatterns, setIncludePatterns] = useState(patternsToText(config?.include_patterns));
+  const [excludePatterns, setExcludePatterns] = useState(patternsToText(config?.exclude_patterns));
+
+  const handleSave = async () => {
+    try {
+      await onSave({
+        repo_path: repoPath,
+        include_patterns: textToPatterns(includePatterns),
+        exclude_patterns: textToPatterns(excludePatterns),
+      });
+    } catch (err) { toast.error(String(err)); }
+  };
+
+  return (
+    <>
+      <div className="space-y-2">
+        <Label>Repository Path</Label>
+        <Input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="/path/to/repo" />
+      </div>
+      <div className="space-y-2">
+        <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+        <Textarea value={includePatterns} onChange={e => setIncludePatterns(e.target.value)} placeholder={"*.py\n*.js"} rows={3} />
+      </div>
+      <div className="space-y-2">
+        <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
+        <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
+      </div>
+      <Button onClick={handleSave} disabled={isPending}>
+        {isPending ? "Saving..." : "Save Configuration"}
+      </Button>
+    </>
   );
 }

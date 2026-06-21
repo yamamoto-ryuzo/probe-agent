@@ -66,8 +66,8 @@ export default function ExperimentsPage() {
   const handleCreate = async () => {
     if (!newFeatureId || !newObjective.trim() || !newSnapshotId) return;
     const validVariants = variants.filter(v => v.label.trim() && v.patch_text.trim());
-    if (validVariants.length < 1) {
-      toast.error("At least one variant with label and patch is required");
+    if (validVariants.length < 2) {
+      toast.error("At least two variants with label and patch are required");
       return;
     }
     try {
@@ -96,7 +96,7 @@ export default function ExperimentsPage() {
   };
 
   const removeVariant = (idx: number) => {
-    if (variants.length <= 1) return;
+    if (variants.length <= 2) return;
     setVariants(prev => prev.filter((_, i) => i !== idx));
   };
 
@@ -171,7 +171,7 @@ export default function ExperimentsPage() {
               <div key={i} className="rounded-lg border p-3 space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-medium text-muted-foreground">Variant {i + 1}</span>
-                  {variants.length > 1 && (
+                  {variants.length > 2 && (
                     <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => removeVariant(i)}>
                       <Trash2 className="h-3 w-3" />
                     </Button>
@@ -199,7 +199,7 @@ export default function ExperimentsPage() {
           </div>
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !newFeatureId || !newObjective.trim() || !newSnapshotId}
+            disabled={createExperiment.isPending || !newFeatureId || !newObjective.trim() || !newSnapshotId || variants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2}
             className="w-full"
           >
             {createExperiment.isPending ? "Creating..." : "Create Experiment"}
