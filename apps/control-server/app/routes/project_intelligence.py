@@ -27,33 +27,24 @@ from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     CodeSymbolOut,
     DraftGenerationResult,
-    ExperimentSummary,
-    ExperimentVariant,
-    FeatureCodeLink,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
     FeatureEvidence,
-    FeatureProfile,
     IntelligenceRunOut,
     LatestDraftsOut,
     LinkReviewUpdate,
     ProbePatchOut,
-    ProbePlan,
     ProbePlanOut,
     ProbePlansListOut,
-    ProbePoint,
     ProbePointOut,
     ProbePointStatusUpdate,
-    ProjectIntelligenceMock,
     RepositoryConfigOut,
     RepositoryConfigUpdate,
-    RepositorySnapshot,
     SnapshotFileOut,
     SnapshotOut,
     SymbolIndexOut,
     SymbolIndexWarningOut,
-    SystemProfile,
     SystemProfileDraftOut,
     ValidationCommandOut,
     ValidationRunOut,
@@ -155,6 +146,7 @@ def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOu
     return SnapshotOut(
         id=snapshot_row["id"],
         system_id=snapshot_row["system_id"],
+        repo_path=snapshot_row["repo_path"],
         commit_sha=snapshot_row["commit_sha"],
         status=snapshot_row["status"],
         file_count=snapshot_row["file_count"],
@@ -189,10 +181,10 @@ def create_snapshot_endpoint(
         cur = conn.execute(
             """
             INSERT INTO repository_snapshots
-                (system_id, commit_sha, status, created_at)
-            VALUES (?, '', 'indexing', ?)
+                (system_id, repo_path, commit_sha, status, created_at)
+            VALUES (?, ?, '', 'indexing', ?)
             """,
-            (system_id, now),
+            (system_id, repo_path, now),
         )
         snapshot_id = cur.lastrowid
 
@@ -271,6 +263,21 @@ def get_latest_snapshot(
         if row is None:
             return None
         return _snapshot_out(conn, row, include_files=True)
+
+
+@router.get("/repository/snapshots", response_model=List[SnapshotOut])
+def list_snapshots(
+    system_id: int = Depends(get_system_id),
+) -> List[SnapshotOut]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC
+            """,
+            (system_id,),
+        ).fetchall()
+        return [_snapshot_out(conn, row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -994,10 +1001,11 @@ def generate_code_links_endpoint(
         draft_run_row = conn.execute(
             """
             SELECT * FROM intelligence_runs
-            WHERE system_id = ? AND run_type = 'repository_drafts' AND status = 'completed'
+            WHERE system_id = ? AND snapshot_id = ?
+              AND run_type = 'repository_drafts' AND status = 'completed'
             ORDER BY id DESC LIMIT 1
             """,
-            (system_id,),
+            (system_id, snapshot_id),
         ).fetchone()
         if draft_run_row is None:
             raise HTTPException(
@@ -1349,9 +1357,10 @@ def generate_probe_plan_endpoint(
             """SELECT fd.* FROM feature_drafts fd
                JOIN intelligence_runs ir ON fd.intelligence_run_id = ir.id
                WHERE fd.system_id = ? AND fd.feature_id = ?
+                 AND fd.snapshot_id = ?
                  AND ir.status = 'completed'
                ORDER BY fd.id DESC LIMIT 1""",
-            (system_id, feature_id),
+            (system_id, feature_id, snapshot_id),
         ).fetchone()
     if fd_row is None:
         raise HTTPException(
@@ -1367,9 +1376,10 @@ def generate_probe_plan_endpoint(
                FROM feature_code_links fcl
                JOIN code_symbols cs ON fcl.symbol_id = cs.id
                WHERE fcl.system_id = ? AND fcl.feature_id = ?
+                 AND fcl.snapshot_id = ?
                  AND fcl.review_status = 'accepted'
                ORDER BY fcl.confidence DESC""",
-            (system_id, feature_id),
+            (system_id, feature_id, snapshot_id),
         ).fetchall()
     if not link_rows:
         raise HTTPException(
@@ -1461,15 +1471,16 @@ def generate_probe_plan_endpoint(
             )
             run_id = cur.lastrowid
 
+            plan_status = "proposed" if plan_result.error is None else "rejected"
             cur = conn.execute(
                 """INSERT INTO probe_plans
                        (system_id, snapshot_id, intelligence_run_id,
                         feature_id, objective, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     system_id, snapshot_id, run_id,
                     feature_id, plan_result.objective,
-                    now, now,
+                    plan_status, now, now,
                 ),
             )
             plan_id = cur.lastrowid
@@ -1558,6 +1569,11 @@ def update_probe_point_status(
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Probe point not found")
+        if payload.status == "approved" and row["denylist_hit"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Safety-denylisted probe points cannot be approved",
+            )
         conn.execute(
             """UPDATE probe_points SET status = ?, updated_at = ? WHERE id = ?""",
             (payload.status, now, point_id),
@@ -1595,22 +1611,19 @@ def generate_patch_endpoint(
     snapshot_id = plan_row["snapshot_id"]
     with get_conn() as conn:
         snapshot_row = conn.execute(
-            "SELECT * FROM repository_snapshots WHERE id = ?",
-            (snapshot_id,),
-        ).fetchone()
-        config_row = conn.execute(
-            "SELECT * FROM repository_configs WHERE system_id = ?",
-            (system_id,),
+            "SELECT * FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
         ).fetchone()
     if snapshot_row is None or snapshot_row["status"] != "ready":
         raise HTTPException(status_code=400, detail="Snapshot is not ready")
-    if config_row is None:
-        raise HTTPException(status_code=400, detail="Repository is not configured")
+    if not snapshot_row["repo_path"]:
+        raise HTTPException(status_code=409, detail="Snapshot repository path is unavailable")
 
     with get_conn() as conn:
         point_rows = conn.execute(
             """SELECT * FROM probe_points
                WHERE plan_id = ? AND status = 'approved'
+                 AND denylist_hit IS NULL
                ORDER BY path, line_start""",
             (plan_id,),
         ).fetchall()
@@ -1636,7 +1649,7 @@ def generate_patch_endpoint(
     os.makedirs(worktree_base, exist_ok=True)
 
     patch_result = generate_patch(
-        repo_path=config_row["repo_path"],
+        repo_path=snapshot_row["repo_path"],
         commit_sha=snapshot_row["commit_sha"],
         approved_points=approved,
         worktree_base=worktree_base,
@@ -1649,14 +1662,16 @@ def generate_patch_endpoint(
         cur = conn.execute(
             """INSERT INTO probe_patches
                    (plan_id, system_id, snapshot_id, commit_sha, diff,
-                    worktree_path, skipped, status, error, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    worktree_path, skipped, status, error,
+                    cleanup_state, cleanup_error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 plan_id, system_id, snapshot_id,
                 snapshot_row["commit_sha"], patch_result.diff,
                 patch_result.worktree_path,
                 json.dumps(patch_result.skipped),
-                patch_status, patch_result.error, now,
+                patch_status, patch_result.error,
+                patch_result.cleanup_state, patch_result.cleanup_error, now,
             ),
         )
         patch_id = cur.lastrowid
@@ -1671,9 +1686,12 @@ def generate_patch_endpoint(
         snapshot_id=row["snapshot_id"],
         commit_sha=row["commit_sha"],
         diff=row["diff"],
+        worktree_path=row["worktree_path"],
         skipped=json.loads(row["skipped"]),
         status=row["status"],
         error=row["error"],
+        cleanup_state=row["cleanup_state"],
+        cleanup_error=row["cleanup_error"],
         created_at=row["created_at"],
     )
 
@@ -1739,9 +1757,12 @@ def list_probe_patches(
                 snapshot_id=row["snapshot_id"],
                 commit_sha=row["commit_sha"],
                 diff=row["diff"],
+                worktree_path=row["worktree_path"],
                 skipped=json.loads(row["skipped"]),
                 status=row["status"],
                 error=row["error"],
+                cleanup_state=row["cleanup_state"],
+                cleanup_error=row["cleanup_error"],
                 validation_runs=validation_runs,
                 created_at=row["created_at"],
             ))
@@ -1813,9 +1834,12 @@ def get_probe_patch(
         snapshot_id=row["snapshot_id"],
         commit_sha=row["commit_sha"],
         diff=row["diff"],
+        worktree_path=row["worktree_path"],
         skipped=json.loads(row["skipped"]),
         status=row["status"],
         error=row["error"],
+        cleanup_state=row["cleanup_state"],
+        cleanup_error=row["cleanup_error"],
         validation_runs=validation_runs,
         created_at=row["created_at"],
     )
@@ -1856,7 +1880,11 @@ def validate_patch_endpoint(
     patch_id: int,
     system_id: int = Depends(get_system_id),
 ) -> ProbePatchOut:
-    from ..patch_generator import ApprovedPoint, create_worktree, cleanup_worktree
+    from ..patch_generator import (
+        apply_unified_diff,
+        cleanup_worktree,
+        create_worktree,
+    )
     from ..validation_runner import load_validation_config_text, run_validation
 
     with get_conn() as conn:
@@ -1870,25 +1898,45 @@ def validate_patch_endpoint(
         raise HTTPException(status_code=400, detail="Cannot validate a failed patch")
 
     with get_conn() as conn:
-        config_row = conn.execute(
-            "SELECT * FROM repository_configs WHERE system_id = ?",
-            (system_id,),
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE id = ? AND system_id = ?
+            """,
+            (patch_row["snapshot_id"], system_id),
         ).fetchone()
-    if config_row is None:
-        raise HTTPException(status_code=400, detail="Repository is not configured")
+        config_file = conn.execute(
+            """
+            SELECT path, content FROM snapshot_files
+            WHERE snapshot_id = ? AND path IN ('probe-agent.yml', 'probe-agent.example.yml')
+            ORDER BY CASE path WHEN 'probe-agent.yml' THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (patch_row["snapshot_id"],),
+        ).fetchone()
+    if snapshot_row is None or not snapshot_row["repo_path"]:
+        raise HTTPException(status_code=409, detail="Snapshot repository path is unavailable")
 
-    repo_path = config_row["repo_path"]
+    repo_path = snapshot_row["repo_path"]
     commit_sha = patch_row["commit_sha"]
 
     try:
-        try:
-            config_bytes = read_file_at_commit(
-                repo_path, commit_sha, "probe-agent.yml"
-            )
-        except GitError:
-            config_bytes = read_file_at_commit(
-                repo_path, commit_sha, "probe-agent.example.yml"
-            )
+        if config_file is not None:
+            config_bytes = bytes(config_file["content"] or b"")
+        else:
+            config_bytes = None
+            for config_path in ("probe-agent.yml", "probe-agent.example.yml"):
+                try:
+                    config_bytes = read_file_at_commit(
+                        repo_path, commit_sha, config_path
+                    )
+                    break
+                except GitError:
+                    continue
+            if config_bytes is None:
+                raise GitError(
+                    "probe-agent.yml is not present at the pinned commit"
+                )
         val_config = load_validation_config_text(
             config_bytes.decode("utf-8", errors="strict")
         )
@@ -1902,61 +1950,66 @@ def validate_patch_endpoint(
     os.makedirs(worktree_base, exist_ok=True)
 
     baseline_worktree = None
-    probed_worktree = patch_row["worktree_path"]
+    probed_worktree = None
     now = time.time()
-    cleanup_result = None
+    cleanup_results = {}
 
     try:
         baseline_worktree = create_worktree(
             repo_path, commit_sha, worktree_base + "/baseline",
         )
+        probed_worktree = create_worktree(
+            repo_path, commit_sha, worktree_base + "/probed",
+        )
+        patch_error = apply_unified_diff(probed_worktree, patch_row["diff"])
+        if patch_error:
+            raise GitError(f"Failed to apply stored patch: {patch_error}")
     except GitError as exc:
+        if baseline_worktree:
+            cleanup_results["baseline"] = cleanup_worktree(
+                repo_path, baseline_worktree
+            )
+        if probed_worktree:
+            cleanup_results["probed"] = cleanup_worktree(repo_path, probed_worktree)
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to create baseline worktree: {exc}",
+            detail=f"Failed to prepare validation worktrees: {exc}",
         )
 
     try:
         baseline_result = run_validation("baseline", baseline_worktree, val_config)
-
-        if probed_worktree and os.path.isdir(probed_worktree):
-            with get_conn() as conn:
-                trace_count_before = conn.execute(
-                    "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
-                    (system_id,),
-                ).fetchone()["count"]
-            probed_result = run_validation("probed", probed_worktree, val_config)
-            with get_conn() as conn:
-                trace_count_after = conn.execute(
-                    "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
-                    (system_id,),
-                ).fetchone()["count"]
-            probed_result.trace_received = trace_count_after > trace_count_before
-            probed_result.trace_status = (
-                "received" if probed_result.trace_received else "missing"
-            )
-        else:
-            from ..validation_runner import ValidationResult
-            probed_result = ValidationResult(
-                variant="probed",
-                worktree_path=probed_worktree or "",
-                error="Probed worktree is missing",
-            )
-            probed_result.trace_received = False
-            probed_result.trace_status = "missing"
+        with get_conn() as conn:
+            trace_count_before = conn.execute(
+                "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["count"]
+        probed_result = run_validation("probed", probed_worktree, val_config)
+        with get_conn() as conn:
+            trace_count_after = conn.execute(
+                "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["count"]
+        probed_result.trace_received = trace_count_after > trace_count_before
+        probed_result.trace_status = (
+            "received" if probed_result.trace_received else "missing"
+        )
     finally:
         if baseline_worktree:
-            cleanup_result = cleanup_worktree(repo_path, baseline_worktree)
+            cleanup_results["baseline"] = cleanup_worktree(
+                repo_path, baseline_worktree
+            )
+        if probed_worktree:
+            cleanup_results["probed"] = cleanup_worktree(repo_path, probed_worktree)
 
     with get_conn() as conn:
         conn.execute("BEGIN")
         try:
             for result in [baseline_result, probed_result]:
-                cleanup_state = "retained"
-                cleanup_error = None
-                if result.variant == "baseline" and cleanup_result:
-                    cleanup_state = cleanup_result.state
-                    cleanup_error = cleanup_result.error
+                cleanup_result = cleanup_results.get(result.variant)
+                cleanup_state = (
+                    cleanup_result.state if cleanup_result else "not_attempted"
+                )
+                cleanup_error = cleanup_result.error if cleanup_result else None
                 cur = conn.execute(
                     """INSERT INTO validation_runs
                            (patch_id, system_id, variant, worktree_path,
@@ -2002,126 +2055,3 @@ def validate_patch_endpoint(
             raise
 
     return get_probe_patch(patch_id, system_id)
-
-
-# ---------------------------------------------------------------------------
-# Legacy mock endpoint — kept for Experiments tab
-# ---------------------------------------------------------------------------
-
-
-@router.get("/project-intelligence", response_model=ProjectIntelligenceMock)
-def get_project_intelligence_mock(
-    system_id: int = Depends(get_system_id),
-) -> ProjectIntelligenceMock:
-    """Development fixture for tabs not yet backed by real data (Probe Planner, Experiments)."""
-    repository = RepositorySnapshot(
-        repo_path="/path/to/target-repository",
-        commit_sha="0000000000000000000000000000000000000000",
-        included_paths=["README.md", "docs/**", "src/**", "tests/**"],
-        excluded_paths=[".env", "secrets/**", "data/**"],
-        status="not_configured",
-    )
-    features = [
-        FeatureProfile(
-            feature_id="repository-understanding",
-            name="Repository Understanding",
-            summary="Committed documentation and source are indexed with evidence.",
-            user_value="The agent can explain the system before proposing instrumentation.",
-            success_criteria=[
-                "Only files from a pinned commit are read",
-                "Every generated statement links to repository evidence",
-            ],
-            risks=["Secrets may be exposed if the committed-files boundary is bypassed"],
-            evidence=[
-                FeatureEvidence(
-                    path="docs/project-intelligence.md",
-                    start_line=1,
-                    end_line=10,
-                    summary="Defines the committed-files-only boundary.",
-                )
-            ],
-            code_links=[
-                FeatureCodeLink(
-                    path="apps/control-server/app/routes/project_intelligence.py",
-                    symbol="get_project_intelligence_mock",
-                    kind="route",
-                    confidence=1.0,
-                    decision_method="manual",
-                )
-            ],
-            decision_method="manual",
-        ),
-    ]
-    probe_plans = [
-        ProbePlan(
-            feature_id="feature-map",
-            objective="Observe feature extraction without modifying the target repository.",
-            probe_points=[
-                ProbePoint(
-                    component_id="feature-map-builder",
-                    feature_id="feature-map",
-                    path="apps/control-server/app/routes/project_intelligence.py",
-                    symbol="get_project_intelligence_mock",
-                    reason="Represents the future feature extraction boundary.",
-                    recommended_mode="trace",
-                    side_effect_risk="low",
-                )
-            ],
-            avoid_probe_points=[
-                "Git credential handling",
-                "File deletion, persistence, billing, and external side effects",
-            ],
-            decision_method="manual",
-        )
-    ]
-    experiments = [
-        ExperimentSummary(
-            experiment_id="mock-experiment-1",
-            feature_id="feature-map",
-            objective="Compare baseline feature mapping with a code-index-assisted variant.",
-            baseline_commit=repository.commit_sha,
-            variants=[
-                ExperimentVariant(variant_id="baseline", label="Documentation only"),
-                ExperimentVariant(
-                    variant_id="ast-index",
-                    label="Documentation plus Python AST index",
-                    patch_summary="Add code-symbol candidates; do not modify the target repo.",
-                ),
-            ],
-            metrics=[
-                "test_pass_rate",
-                "mapping_precision",
-                "mapping_review_rate",
-                "duration_ms",
-            ],
-            interpretation_method="manual",
-        )
-    ]
-    return ProjectIntelligenceMock(
-        system_id=system_id,
-        deterministic_decision_policy=(
-            "Deterministic rules are allowed only when the output belongs to a "
-            "small, explicitly enumerated finite set. All open-ended inference "
-            "must use an external reasoning-model LLM API."
-        ),
-        repository=repository,
-        system_profile_draft=SystemProfile(
-            name="Target system draft",
-            purpose="Drafted from committed README and docs with evidence.",
-            target_users=["developers", "system improvement owners"],
-            stakeholder_value="Safer, evidence-based probe and experiment planning.",
-            constraints=[
-                "Do not modify the target repository automatically",
-                "Do not read untracked or uncommitted files",
-                "Do not adopt a variant based on LLM evaluation alone",
-            ],
-            success_criteria=[
-                "A reviewable Feature Map is produced",
-                "Probe plans identify side-effect risk",
-                "Experiments run in an isolated workspace",
-            ],
-        ),
-        features=features,
-        probe_plans=probe_plans,
-        experiments=experiments,
-    )

@@ -17,6 +17,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def unsafe_test_execution(monkeypatch):
+    monkeypatch.setenv("PROBE_UNSAFE_ALLOW_HOST_EXECUTION", "true")
+
+
 @pytest.fixture
 def admin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("PROBE_DB_PATH", str(tmp_path / "probe-plan-test.db"))
@@ -131,7 +136,7 @@ def git_repo(tmp_path):
             - echo "smoke ok"
         runtime:
           timeout_seconds: 30
-          network: true
+          network: false
     """))
 
     subprocess.run(
@@ -541,7 +546,7 @@ class TestRunValidation:
             test_commands=["echo test"],
             smoke_commands=["echo smoke"],
             timeout_seconds=30,
-            network=True,
+            network=False,
         )
         result = run_validation("baseline", str(tmp_path), config)
         assert result.overall_success is True
@@ -556,7 +561,7 @@ class TestRunValidation:
             test_commands=["exit 1"],
             smoke_commands=["echo smoke"],
             timeout_seconds=30,
-            network=True,
+            network=False,
         )
         result = run_validation("probed", str(tmp_path), config)
         assert result.overall_success is False
@@ -569,7 +574,7 @@ class TestRunValidation:
             install_commands=["echo install"],
             test_commands=[],
             timeout_seconds=30,
-            network=True,
+            network=False,
         )
         result = run_validation("baseline", str(tmp_path), config)
         assert result.error is not None
@@ -609,6 +614,8 @@ class TestProbePlanGeneration:
         run = data.get("intelligence_run", {})
         assert run.get("status") == "failed"
         assert run.get("is_mock") is True
+        assert data["status"] == "rejected"
+        assert data["probe_points"] == []
 
     def test_generates_plan_with_reasoning_model(
         self, admin_client, git_repo, tmp_path, monkeypatch
@@ -669,6 +676,12 @@ class TestProbePlanGeneration:
         point = points[0]
         assert point["denylist_hit"] is not None
         assert point["side_effect_risk"] == "high"
+        approval = admin_client.put(
+            f"/repository/probe-points/{point['id']}/status",
+            json={"status": "approved"},
+            headers=h,
+        )
+        assert approval.status_code == 409
 
     def test_lists_plans(self, admin_client, git_repo, tmp_path, monkeypatch):
         token = _login(admin_client)
@@ -813,6 +826,8 @@ class TestPatchGeneration:
         assert patch["status"] == "generated"
         assert "@probe" in patch["diff"]
         assert "probe_agent" in patch["diff"]
+        assert patch["cleanup_state"] == "removed"
+        assert not os.path.exists(patch["worktree_path"])
 
     def test_requires_approved_points(
         self, admin_client, git_repo, tmp_path, monkeypatch
@@ -949,6 +964,7 @@ class TestValidation:
         assert len(probed) == 1
         assert baseline[0]["overall_success"] is True
         assert baseline[0]["cleanup_state"] == "removed"
+        assert probed[0]["cleanup_state"] == "removed"
         assert probed[0]["trace_status"] == "missing"
         for cmd in baseline[0]["commands"]:
             assert cmd["exit_code"] == 0

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import time
@@ -51,9 +52,27 @@ class ValidationConfig:
     install_commands: List[str] = field(default_factory=list)
     test_commands: List[str] = field(default_factory=list)
     smoke_commands: List[str] = field(default_factory=list)
+    workload_commands: List[str] = field(default_factory=list)
     timeout_seconds: int = 60
     network: bool = False
     env_allowlist: Dict[str, str] = field(default_factory=dict)
+    result_artifact_path: str = ".probe-agent/experiment-result.json"
+    artifact_retention_seconds: int = 86400
+
+
+_ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+_FORBIDDEN_ENV = {
+    "BASH_ENV",
+    "ENV",
+    "HOME",
+    "LD_LIBRARY_PATH",
+    "LD_PRELOAD",
+    "PATH",
+    "PWD",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "SHELLOPTS",
+}
 
 
 def load_validation_config_text(raw_text: str) -> ValidationConfig:
@@ -73,6 +92,7 @@ def load_validation_config_text(raw_text: str) -> ValidationConfig:
     install = commands.get("install", [])
     test = commands.get("test", [])
     smoke = commands.get("smoke", [])
+    workload = commands.get("workload", [])
 
     if not isinstance(install, list):
         install = [str(install)] if install else []
@@ -80,27 +100,55 @@ def load_validation_config_text(raw_text: str) -> ValidationConfig:
         test = [str(test)] if test else []
     if not isinstance(smoke, list):
         smoke = [str(smoke)] if smoke else []
+    if not isinstance(workload, list):
+        workload = [str(workload)] if workload else []
 
     install = [str(c) for c in install if c]
     test = [str(c) for c in test if c]
     smoke = [str(c) for c in smoke if c]
+    workload = [str(c) for c in workload if c]
+    all_commands = install + test + smoke + workload
+    if len(all_commands) > 50:
+        raise GitError("probe-agent.yml contains too many commands")
+    if any(len(command) > 2000 for command in all_commands):
+        raise GitError("probe-agent.yml command exceeds 2000 characters")
 
     timeout = max(1, min(int(runtime.get("timeout_seconds", 60)), 300))
     network = bool(runtime.get("network", False))
+    if network:
+        raise GitError("runtime.network must be false for isolated execution")
 
     env_allowlist = {}
     env_raw = runtime.get("env", {})
     if isinstance(env_raw, dict):
         for k, v in env_raw.items():
-            env_allowlist[str(k)] = str(v)
+            key = str(k)
+            if not _ENV_NAME.fullmatch(key) or key in _FORBIDDEN_ENV:
+                raise GitError(f"runtime.env contains forbidden key: {key}")
+            env_allowlist[key] = str(v)
+
+    experiment = raw.get("experiment", {})
+    if not isinstance(experiment, dict):
+        raise GitError("experiment section must be a mapping")
+    result_artifact_path = str(
+        experiment.get(
+            "result_artifact_path", ".probe-agent/experiment-result.json"
+        )
+    )
+    artifact_retention_seconds = max(
+        0, min(int(experiment.get("artifact_retention_seconds", 86400)), 2592000)
+    )
 
     return ValidationConfig(
         install_commands=install,
         test_commands=test,
         smoke_commands=smoke,
+        workload_commands=workload,
         timeout_seconds=timeout,
         network=network,
         env_allowlist=env_allowlist,
+        result_artifact_path=result_artifact_path,
+        artifact_retention_seconds=artifact_retention_seconds,
     )
 
 
@@ -138,19 +186,39 @@ def _run_command(
     worktree_path: str,
     env: Dict[str, str],
     timeout: int,
-    network: bool = True,
+    network: bool = False,
 ) -> CommandResult:
     start = time.monotonic()
     timed_out = False
+    if network:
+        return CommandResult(
+            command=command,
+            exit_code=-1,
+            duration_ms=0.0,
+            stdout="",
+            stderr="Network-enabled execution is prohibited",
+        )
     try:
         argv: Any = command
         use_shell = True
         if not network:
-            if platform.system() == "Darwin" and shutil.which("sandbox-exec"):
+            if os.getenv("PROBE_UNSAFE_ALLOW_HOST_EXECUTION", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                pass
+            elif platform.system() == "Darwin" and shutil.which("sandbox-exec"):
+                escaped = worktree_path.replace('"', '\\"')
                 argv = [
                     "sandbox-exec",
                     "-p",
-                    "(version 1) (allow default) (deny network*)",
+                    (
+                        "(version 1) (deny default) "
+                        "(allow process*) (allow file-read*) "
+                        f'(allow file-write* (subpath "{escaped}") (subpath "/tmp")) '
+                        "(deny network*)"
+                    ),
                     "/bin/sh",
                     "-c",
                     command,
@@ -158,12 +226,30 @@ def _run_command(
                 use_shell = False
             elif shutil.which("bwrap"):
                 argv = [
-                    "bwrap", "--unshare-net", "--dev-bind", "/", "/",
-                    "/bin/sh", "-c", command,
+                    "bwrap",
+                    "--die-with-parent",
+                    "--new-session",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--tmpfs",
+                    "/tmp",
+                    "--tmpfs",
+                    "/data",
+                    "--tmpfs",
+                    "/root",
+                    "--tmpfs",
+                    "/repositories",
+                    "--bind",
+                    worktree_path,
+                    "/workspace",
+                    "--chdir",
+                    "/workspace",
+                    "/bin/sh",
+                    "-c",
+                    command,
                 ]
-                use_shell = False
-            elif shutil.which("unshare"):
-                argv = ["unshare", "--user", "--map-root-user", "--net", "/bin/sh", "-c", command]
                 use_shell = False
             else:
                 return CommandResult(
@@ -241,6 +327,7 @@ def run_validation(
         [(cmd, "install") for cmd in config.install_commands]
         + [(cmd, "test") for cmd in config.test_commands]
         + [(cmd, "smoke") for cmd in config.smoke_commands]
+        + [(cmd, "workload") for cmd in config.workload_commands]
     )
 
     if not config.test_commands:
@@ -260,6 +347,7 @@ def run_validation(
         if not config.network and (
             "unshare failed" in cmd_result.stderr
             or "sandbox backend is available" in cmd_result.stderr
+            or "bwrap:" in cmd_result.stderr.lower()
             or "sandbox-exec" in cmd_result.stderr.lower()
             and "operation not permitted" in cmd_result.stderr.lower()
         ):

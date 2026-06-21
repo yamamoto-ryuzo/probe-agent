@@ -43,6 +43,8 @@ class PatchResult:
     files: List[PatchFile]
     skipped: List[str]
     error: Optional[str] = None
+    cleanup_state: str = "not_attempted"
+    cleanup_error: Optional[str] = None
 
 
 @dataclass
@@ -256,6 +258,27 @@ def cleanup_worktree(repo_path: str, worktree_path: str) -> CleanupResult:
     )
 
 
+def apply_unified_diff(worktree_path: str, diff: str) -> Optional[str]:
+    if not diff.strip():
+        return "Patch diff is empty"
+    for args in (
+        ["apply", "--check", "--whitespace=nowarn", "-"],
+        ["apply", "--whitespace=nowarn", "-"],
+    ):
+        result = _run_git(
+            worktree_path,
+            args,
+            timeout=30,
+            input_bytes=diff.encode("utf-8"),
+        )
+        if result.returncode != 0:
+            return (
+                result.stderr.decode("utf-8", errors="replace").strip()
+                or "git apply failed"
+            )
+    return None
+
+
 def generate_patch(
     repo_path: str,
     commit_sha: str,
@@ -271,6 +294,7 @@ def generate_patch(
             error="No approved probe points",
         )
 
+    cleanup = None
     try:
         worktree_path = create_worktree(repo_path, commit_sha, worktree_base)
     except GitError as exc:
@@ -323,17 +347,19 @@ def generate_patch(
         diff = diff_result.stdout.decode("utf-8", errors="replace") if diff_result.returncode == 0 else ""
 
     except Exception as exc:
-        return PatchResult(
-            worktree_path=worktree_path,
-            diff="",
-            files=patch_files,
-            skipped=all_skipped,
-            error=str(exc),
-        )
+        error = str(exc)
+        diff = ""
+    else:
+        error = None
+    finally:
+        cleanup = cleanup_worktree(repo_path, worktree_path)
 
     return PatchResult(
         worktree_path=worktree_path,
         diff=diff,
         files=patch_files,
         skipped=all_skipped,
+        error=error,
+        cleanup_state=cleanup.state,
+        cleanup_error=cleanup.error,
     )
