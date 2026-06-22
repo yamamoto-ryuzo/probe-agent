@@ -72,6 +72,9 @@ describe("Repository config page", () => {
           exclude_patterns: ["__pycache__"],
         });
       }
+      if (path === "/repository-candidates") {
+        return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      }
       if (path === "/repository/snapshots") return Promise.resolve([]);
       if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
       return Promise.resolve(null);
@@ -81,7 +84,7 @@ describe("Repository config page", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByDisplayValue("/repos/alpha")).toBeInTheDocument();
+      expect(screen.getByRole("combobox")).toHaveValue("/repos/alpha");
     });
     const textareas = screen.getAllByRole("textbox");
     const includeTextarea = textareas.find(t => (t as HTMLTextAreaElement).value.includes("*.py"));
@@ -92,6 +95,9 @@ describe("Repository config page", () => {
   test("shows empty form when system has no config", async () => {
     mockApi.get.mockImplementation((path: string) => {
       if (path === "/repository") return Promise.resolve(null);
+      if (path === "/repository-candidates") {
+        return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
+      }
       if (path === "/repository/snapshots") return Promise.resolve([]);
       if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
       return Promise.resolve(null);
@@ -101,9 +107,9 @@ describe("Repository config page", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByPlaceholderText("/path/to/repo")).toBeInTheDocument();
+      expect(screen.getByRole("combobox")).toBeInTheDocument();
     });
-    expect(screen.getByPlaceholderText("/path/to/repo")).toHaveValue("");
+    expect(screen.getByRole("combobox")).toHaveValue("");
   });
 
   test("sends include_patterns and exclude_patterns as arrays", async () => {
@@ -113,6 +119,9 @@ describe("Repository config page", () => {
           id: 1, system_id: 1, repo_path: "/repos/alpha",
           include_patterns: ["*.py"], exclude_patterns: [],
         });
+      }
+      if (path === "/repository-candidates") {
+        return Promise.resolve([{ name: "alpha", path: "/repos/alpha" }]);
       }
       if (path === "/repository/snapshots") return Promise.resolve([]);
       if (path === "/repository/symbols") return Promise.resolve({ symbols: [], symbol_count: 0 });
@@ -127,7 +136,7 @@ describe("Repository config page", () => {
     render(<RepositoryPage />, { wrapper: createWrapper() });
 
     await waitFor(() => {
-      expect(screen.getByDisplayValue("/repos/alpha")).toBeInTheDocument();
+      expect(screen.getByRole("combobox")).toHaveValue("/repos/alpha");
     });
 
     const textareas = screen.getAllByRole("textbox");
@@ -316,6 +325,87 @@ describe("Experiment decision (adopted)", () => {
         variant_key: "opt-v1",
         note: "Better performance",
       });
+    });
+  });
+});
+
+// ── Probe Patch explicit apply tests ────────────────────────────────
+
+describe("Probe Patch application", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  test("requires typed confirmation and sends the pinned commit", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/probe-plans") {
+        return Promise.resolve({
+          system_id: 1,
+          is_mock: false,
+          plans: [{
+            id: 10,
+            feature_id: "feat-1",
+            objective: "Observe behavior",
+            status: "proposed",
+            created_at: "2024-01-01",
+            probe_points: [],
+          }],
+        });
+      }
+      if (path === "/repository/probe-patches") {
+        return Promise.resolve([{
+          id: 20,
+          plan_id: 10,
+          system_id: 1,
+          snapshot_id: 5,
+          commit_sha: "abcdef1234567890",
+          diff: "diff --git a/a.py b/a.py",
+          worktree_path: null,
+          skipped: [],
+          status: "generated",
+          error: null,
+          cleanup_state: "removed",
+          cleanup_error: null,
+          apply_status: "not_applied",
+          apply_error: null,
+          applied_at: null,
+          applied_by_user_id: null,
+          validation_runs: [
+            { id: 1, variant: "baseline", overall_success: true, commands: [] },
+            { id: 2, variant: "probed", overall_success: true, commands: [] },
+          ],
+          created_at: "2024-01-01",
+        }]);
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue({ apply_status: "applied" });
+
+    const { default: ProbePlannerPage } = await import("@/pages/probe-planner");
+    render(<ProbePlannerPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Feature: feat-1")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Feature: feat-1"));
+    await waitFor(() => expect(screen.getByText("Apply")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Apply"));
+
+    const confirmButton = await screen.findByText("Apply to Repository");
+    expect(confirmButton).toBeDisabled();
+    fireEvent.change(screen.getByPlaceholderText("APPLY"), {
+      target: { value: "APPLY" },
+    });
+    expect(confirmButton).not.toBeDisabled();
+    fireEvent.click(confirmButton);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-patches/20/apply",
+        {
+          confirmed: true,
+          expected_commit_sha: "abcdef1234567890",
+        },
+      );
     });
   });
 });

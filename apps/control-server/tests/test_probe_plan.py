@@ -297,6 +297,43 @@ def _setup_full_pipeline(client, token, system_id, repo_path, monkeypatch):
     return h
 
 
+def _create_validated_patch(
+    client, token, system_id, repo_path, monkeypatch, worktree_base
+):
+    h = _setup_full_pipeline(client, token, system_id, repo_path, monkeypatch)
+    monkeypatch.setenv("PROBE_WORKTREE_BASE", str(worktree_base))
+    _enable_reasoning(monkeypatch, _ReasoningProbePlanClient)
+    from app.llm import get_llm_client
+    get_llm_client.cache_clear()
+
+    plan_response = client.post(
+        "/repository/probe-plans/generate?feature_id=user-management",
+        headers=h,
+    )
+    assert plan_response.status_code == 201, plan_response.text
+    plan = plan_response.json()
+    for point in plan["probe_points"]:
+        approval = client.put(
+            f"/repository/probe-points/{point['id']}/status",
+            json={"status": "approved"},
+            headers=h,
+        )
+        assert approval.status_code == 200, approval.text
+
+    patch_response = client.post(
+        f"/repository/probe-plans/{plan['id']}/patch",
+        headers=h,
+    )
+    assert patch_response.status_code == 201, patch_response.text
+    patch = patch_response.json()
+    validation = client.post(
+        f"/repository/probe-patches/{patch['id']}/validate",
+        headers=h,
+    )
+    assert validation.status_code == 201, validation.text
+    return h, validation.json()
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: probe_planner
 # ---------------------------------------------------------------------------
@@ -981,6 +1018,116 @@ class TestValidation:
             headers=h,
         )
         assert r.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# API tests: explicit application to the source repository
+# ---------------------------------------------------------------------------
+
+
+class TestPatchApplication:
+    def test_applies_validated_patch_after_explicit_confirmation(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "apply-test")
+        headers, patch = _create_validated_patch(
+            admin_client,
+            token,
+            system["id"],
+            git_repo,
+            monkeypatch,
+            tmp_path / "worktrees",
+        )
+
+        response = admin_client.post(
+            f"/repository/probe-patches/{patch['id']}/apply",
+            json={
+                "confirmed": True,
+                "expected_commit_sha": patch["commit_sha"],
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["apply_status"] == "applied"
+        assert body["applied_by_user_id"] is not None
+        source = (git_repo / "src" / "main.py").read_text()
+        assert "from probe_agent import probe" in source
+        assert "@probe" in source
+        assert subprocess.run(
+            ["git", "-C", str(git_repo), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip() == patch["commit_sha"]
+
+    def test_rejects_apply_when_working_tree_is_dirty(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "dirty-apply-test")
+        headers, patch = _create_validated_patch(
+            admin_client,
+            token,
+            system["id"],
+            git_repo,
+            monkeypatch,
+            tmp_path / "worktrees",
+        )
+        (git_repo / "README.md").write_text("# local uncommitted change\n")
+
+        response = admin_client.post(
+            f"/repository/probe-patches/{patch['id']}/apply",
+            json={
+                "confirmed": True,
+                "expected_commit_sha": patch["commit_sha"],
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert "not clean" in response.json()["detail"].lower()
+        assert "@probe" not in (git_repo / "src" / "main.py").read_text()
+
+    def test_rejects_apply_when_head_changed(
+        self, admin_client, git_repo, tmp_path, monkeypatch
+    ):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "stale-apply-test")
+        headers, patch = _create_validated_patch(
+            admin_client,
+            token,
+            system["id"],
+            git_repo,
+            monkeypatch,
+            tmp_path / "worktrees",
+        )
+        (git_repo / "README.md").write_text("# next commit\n")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "README.md"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "advance head"],
+            check=True,
+            capture_output=True,
+        )
+
+        response = admin_client.post(
+            f"/repository/probe-patches/{patch['id']}/apply",
+            json={
+                "confirmed": True,
+                "expected_commit_sha": patch["commit_sha"],
+            },
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert "head changed" in response.json()["detail"].lower()
+        assert "@probe" not in (git_repo / "src" / "main.py").read_text()
 
 
 # ---------------------------------------------------------------------------

@@ -16,10 +16,10 @@ services:
       LLM_TIMEOUT: ${LLM_TIMEOUT:-30}
       INTELLIGENCE_LLM_PROVIDER: ${INTELLIGENCE_LLM_PROVIDER:-}
       INTELLIGENCE_LLM_MODEL: ${INTELLIGENCE_LLM_MODEL:-}
-      PROBE_REPOSITORY_ROOTS: ${PROBE_REPOSITORY_ROOTS:-/repositories}
+      PROBE_REPOSITORY_ROOTS: /repositories
     volumes:
       - probe-data:/data
-      - ${PROBE_REPOSITORY_HOST_ROOT:-.}:/repositories:ro
+      - ${PROBE_REPOSITORY_HOST_ROOT:?Set PROBE_REPOSITORY_HOST_ROOT}:/repositories:rw
     ports:
       - "8000:8000"
     healthcheck:

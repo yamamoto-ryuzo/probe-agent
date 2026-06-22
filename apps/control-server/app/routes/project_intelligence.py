@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
-from ..auth import get_system_id
+from ..auth import Principal, get_system_id, require_user
 from ..code_indexer import index_snapshot_files
 from ..code_mapper import (
     FeatureContext,
@@ -22,7 +22,12 @@ from ..draft_generator import (
     GenerationResult,
     generate_drafts,
 )
-from ..git_ops import GitError, create_snapshot, read_file_at_commit
+from ..git_ops import (
+    GitError,
+    create_snapshot,
+    discover_repository_candidates,
+    read_file_at_commit,
+)
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
     CodeSymbolOut,
@@ -34,11 +39,13 @@ from ..models import (
     IntelligenceRunOut,
     LatestDraftsOut,
     LinkReviewUpdate,
+    ProbePatchApplyRequest,
     ProbePatchOut,
     ProbePlanOut,
     ProbePlansListOut,
     ProbePointOut,
     ProbePointStatusUpdate,
+    RepositoryCandidateOut,
     RepositoryConfigOut,
     RepositoryConfigUpdate,
     SnapshotFileOut,
@@ -53,9 +60,89 @@ from ..models import (
 router = APIRouter()
 
 
+def _probe_patch_out(conn, row) -> ProbePatchOut:
+    val_rows = conn.execute(
+        "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
+        (row["id"],),
+    ).fetchall()
+    validation_runs = []
+    for vr in val_rows:
+        cmd_rows = conn.execute(
+            "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
+            (vr["id"],),
+        ).fetchall()
+        validation_runs.append(ValidationRunOut(
+            id=vr["id"],
+            patch_id=vr["patch_id"],
+            system_id=vr["system_id"],
+            variant=vr["variant"],
+            worktree_path=vr["worktree_path"],
+            overall_success=bool(vr["overall_success"]),
+            total_duration_ms=vr["total_duration_ms"],
+            trace_received=(
+                None if vr["trace_received"] is None
+                else bool(vr["trace_received"])
+            ),
+            trace_status=vr["trace_status"],
+            network_isolation=vr["network_isolation"],
+            cleanup_state=vr["cleanup_state"],
+            cleanup_error=vr["cleanup_error"],
+            commands=[
+                ValidationCommandOut(
+                    id=cr["id"],
+                    command=cr["command"],
+                    exit_code=cr["exit_code"],
+                    duration_ms=cr["duration_ms"],
+                    stdout=cr["stdout"],
+                    stderr=cr["stderr"],
+                    stdout_truncated=bool(cr["stdout_truncated"]),
+                    stderr_truncated=bool(cr["stderr_truncated"]),
+                    timed_out=bool(cr["timed_out"]),
+                )
+                for cr in cmd_rows
+            ],
+            error=vr["error"],
+            created_at=vr["created_at"],
+        ))
+    return ProbePatchOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        diff=row["diff"],
+        worktree_path=row["worktree_path"],
+        skipped=json.loads(row["skipped"]),
+        status=row["status"],
+        error=row["error"],
+        cleanup_state=row["cleanup_state"],
+        cleanup_error=row["cleanup_error"],
+        apply_status=row["apply_status"],
+        apply_error=row["apply_error"],
+        applied_at=row["applied_at"],
+        applied_by_user_id=row["applied_by_user_id"],
+        validation_runs=validation_runs,
+        created_at=row["created_at"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Repository configuration
 # ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/repository-candidates",
+    response_model=List[RepositoryCandidateOut],
+)
+def list_repository_candidates() -> List[RepositoryCandidateOut]:
+    try:
+        return [
+            RepositoryCandidateOut(name=name, path=path)
+            for name, path in discover_repository_candidates()
+        ]
+    except GitError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @router.get("/repository", response_model=Optional[RepositoryConfigOut])
@@ -1679,21 +1766,8 @@ def generate_patch_endpoint(
             "SELECT * FROM probe_patches WHERE id = ?", (patch_id,),
         ).fetchone()
 
-    return ProbePatchOut(
-        id=row["id"],
-        plan_id=row["plan_id"],
-        system_id=row["system_id"],
-        snapshot_id=row["snapshot_id"],
-        commit_sha=row["commit_sha"],
-        diff=row["diff"],
-        worktree_path=row["worktree_path"],
-        skipped=json.loads(row["skipped"]),
-        status=row["status"],
-        error=row["error"],
-        cleanup_state=row["cleanup_state"],
-        cleanup_error=row["cleanup_error"],
-        created_at=row["created_at"],
-    )
+    with get_conn() as conn:
+        return _probe_patch_out(conn, row)
 
 
 @router.get("/repository/probe-patches", response_model=List[ProbePatchOut])
@@ -1705,68 +1779,7 @@ def list_probe_patches(
             "SELECT * FROM probe_patches WHERE system_id = ? ORDER BY id DESC",
             (system_id,),
         ).fetchall()
-        results = []
-        for row in rows:
-            val_rows = conn.execute(
-                "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
-                (row["id"],),
-            ).fetchall()
-            validation_runs = []
-            for vr in val_rows:
-                cmd_rows = conn.execute(
-                    "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
-                    (vr["id"],),
-                ).fetchall()
-                validation_runs.append(ValidationRunOut(
-                    id=vr["id"],
-                    patch_id=vr["patch_id"],
-                    system_id=vr["system_id"],
-                    variant=vr["variant"],
-                    worktree_path=vr["worktree_path"],
-                    overall_success=bool(vr["overall_success"]),
-                    total_duration_ms=vr["total_duration_ms"],
-                    trace_received=(
-                        None if vr["trace_received"] is None
-                        else bool(vr["trace_received"])
-                    ),
-                    trace_status=vr["trace_status"],
-                    network_isolation=vr["network_isolation"],
-                    cleanup_state=vr["cleanup_state"],
-                    cleanup_error=vr["cleanup_error"],
-                    commands=[
-                        ValidationCommandOut(
-                            id=cr["id"],
-                            command=cr["command"],
-                            exit_code=cr["exit_code"],
-                            duration_ms=cr["duration_ms"],
-                            stdout=cr["stdout"],
-                            stderr=cr["stderr"],
-                            stdout_truncated=bool(cr["stdout_truncated"]),
-                            stderr_truncated=bool(cr["stderr_truncated"]),
-                            timed_out=bool(cr["timed_out"]),
-                        )
-                        for cr in cmd_rows
-                    ],
-                    error=vr["error"],
-                    created_at=vr["created_at"],
-                ))
-            results.append(ProbePatchOut(
-                id=row["id"],
-                plan_id=row["plan_id"],
-                system_id=row["system_id"],
-                snapshot_id=row["snapshot_id"],
-                commit_sha=row["commit_sha"],
-                diff=row["diff"],
-                worktree_path=row["worktree_path"],
-                skipped=json.loads(row["skipped"]),
-                status=row["status"],
-                error=row["error"],
-                cleanup_state=row["cleanup_state"],
-                cleanup_error=row["cleanup_error"],
-                validation_runs=validation_runs,
-                created_at=row["created_at"],
-            ))
-    return results
+        return [_probe_patch_out(conn, row) for row in rows]
 
 
 @router.get("/repository/probe-patches/{patch_id}", response_model=ProbePatchOut)
@@ -1782,67 +1795,7 @@ def get_probe_patch(
         if row is None:
             raise HTTPException(status_code=404, detail="Patch not found")
 
-        val_rows = conn.execute(
-            "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
-            (patch_id,),
-        ).fetchall()
-
-        validation_runs = []
-        for vr in val_rows:
-            cmd_rows = conn.execute(
-                "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
-                (vr["id"],),
-            ).fetchall()
-            validation_runs.append(ValidationRunOut(
-                id=vr["id"],
-                patch_id=vr["patch_id"],
-                system_id=vr["system_id"],
-                variant=vr["variant"],
-                worktree_path=vr["worktree_path"],
-                overall_success=bool(vr["overall_success"]),
-                total_duration_ms=vr["total_duration_ms"],
-                trace_received=(
-                    None if vr["trace_received"] is None
-                    else bool(vr["trace_received"])
-                ),
-                trace_status=vr["trace_status"],
-                network_isolation=vr["network_isolation"],
-                cleanup_state=vr["cleanup_state"],
-                cleanup_error=vr["cleanup_error"],
-                commands=[
-                    ValidationCommandOut(
-                        id=cr["id"],
-                        command=cr["command"],
-                        exit_code=cr["exit_code"],
-                        duration_ms=cr["duration_ms"],
-                        stdout=cr["stdout"],
-                        stderr=cr["stderr"],
-                        stdout_truncated=bool(cr["stdout_truncated"]),
-                        stderr_truncated=bool(cr["stderr_truncated"]),
-                        timed_out=bool(cr["timed_out"]),
-                    )
-                    for cr in cmd_rows
-                ],
-                error=vr["error"],
-                created_at=vr["created_at"],
-            ))
-
-    return ProbePatchOut(
-        id=row["id"],
-        plan_id=row["plan_id"],
-        system_id=row["system_id"],
-        snapshot_id=row["snapshot_id"],
-        commit_sha=row["commit_sha"],
-        diff=row["diff"],
-        worktree_path=row["worktree_path"],
-        skipped=json.loads(row["skipped"]),
-        status=row["status"],
-        error=row["error"],
-        cleanup_state=row["cleanup_state"],
-        cleanup_error=row["cleanup_error"],
-        validation_runs=validation_runs,
-        created_at=row["created_at"],
-    )
+        return _probe_patch_out(conn, row)
 
 
 @router.get("/repository/probe-patches/{patch_id}/download")
@@ -1864,6 +1817,103 @@ def download_probe_patch(
             "Content-Disposition": f'attachment; filename="probe-patch-{patch_id}.diff"'
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# Explicit application to the source repository
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-patches/{patch_id}/apply",
+    response_model=ProbePatchOut,
+)
+def apply_probe_patch_endpoint(
+    patch_id: int,
+    payload: ProbePatchApplyRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> ProbePatchOut:
+    from ..patch_generator import apply_patch_to_repository
+
+    with get_conn() as conn:
+        patch_row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+        if patch_row is None:
+            raise HTTPException(status_code=404, detail="Patch not found")
+        snapshot_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (patch_row["snapshot_id"], system_id),
+        ).fetchone()
+        validation_rows = conn.execute(
+            """
+            SELECT variant, overall_success
+            FROM validation_runs
+            WHERE patch_id = ?
+            ORDER BY id DESC
+            """,
+            (patch_id,),
+        ).fetchall()
+
+    if patch_row["apply_status"] == "applied":
+        raise HTTPException(status_code=409, detail="Patch has already been applied")
+    if patch_row["status"] == "failed" or not patch_row["diff"].strip():
+        raise HTTPException(status_code=400, detail="Patch is not applicable")
+    if payload.expected_commit_sha != patch_row["commit_sha"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Confirmation commit does not match the patch snapshot",
+        )
+    if snapshot_row is None or not snapshot_row["repo_path"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Snapshot repository path is unavailable",
+        )
+
+    latest_validation = {}
+    for row in validation_rows:
+        latest_validation.setdefault(row["variant"], bool(row["overall_success"]))
+    if not (
+        latest_validation.get("baseline") is True
+        and latest_validation.get("probed") is True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A successful baseline and probed validation is required",
+        )
+
+    apply_error = apply_patch_to_repository(
+        snapshot_row["repo_path"],
+        patch_row["commit_sha"],
+        patch_row["diff"],
+    )
+    now = time.time()
+    with get_conn() as conn:
+        if apply_error:
+            conn.execute(
+                """
+                UPDATE probe_patches
+                SET apply_status = 'failed', apply_error = ?
+                WHERE id = ?
+                """,
+                (apply_error, patch_id),
+            )
+            raise HTTPException(status_code=409, detail=apply_error)
+        conn.execute(
+            """
+            UPDATE probe_patches
+            SET apply_status = 'applied', apply_error = NULL,
+                applied_at = ?, applied_by_user_id = ?
+            WHERE id = ?
+            """,
+            (now, principal.user_id, patch_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ?", (patch_id,)
+        ).fetchone()
+        return _probe_patch_out(conn, row)
 
 
 # ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ import { api, getSystemId } from "./client";
 import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
-  RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
+  RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
@@ -169,6 +169,14 @@ export function useRepositoryConfig() {
   });
 }
 
+export function useRepositoryCandidates() {
+  return useQuery({
+    queryKey: ["repositoryCandidates"],
+    queryFn: () => api.get<RepositoryCandidateOut[]>("/repository-candidates"),
+    staleTime: 30_000,
+  });
+}
+
 export function useUpdateRepositoryConfig() {
   const qc = useQueryClient();
   return useMutation({
@@ -307,6 +315,18 @@ export function useValidatePatch() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (patchId: number) => api.post<ProbePatchOut>(`/repository/probe-patches/${patchId}/validate`),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePatches") }),
+  });
+}
+
+export function useApplyProbePatch() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ patchId, expectedCommitSha }: { patchId: number; expectedCommitSha: string }) =>
+      api.post<ProbePatchOut>(`/repository/probe-patches/${patchId}/apply`, {
+        confirmed: true,
+        expected_commit_sha: expectedCommitSha,
+      }),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePatches") }),
   });
 }

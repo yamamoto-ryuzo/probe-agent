@@ -92,6 +92,11 @@ export interface RepositoryConfigOut {
   updated_at: string;
 }
 
+export interface RepositoryCandidateOut {
+  name: string;
+  path: string;
+}
+
 export interface SnapshotFileOut {
   path: string;
   source_type: string;
@@ -320,6 +325,10 @@ export interface ProbePatchOut {
   error: string | null;
   cleanup_state: string | null;
   cleanup_error: string | null;
+  apply_status: string;
+  apply_error: string | null;
+  applied_at: string | null;
+  applied_by_user_id: number | null;
   validation_runs: ValidationRunOut[];
   created_at: string;
 }

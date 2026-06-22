@@ -1,21 +1,21 @@
 import { useState } from "react";
 import {
-  useRepositoryConfig, useUpdateRepositoryConfig,
+  useRepositoryCandidates, useRepositoryConfig, useUpdateRepositoryConfig,
   useSnapshots, useCreateSnapshot, useSymbols, useIndexSymbols,
 } from "@/api/hooks";
 import { useAuth } from "@/api/auth";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { GitCommit, FolderTree, Code2, RefreshCw } from "lucide-react";
-import type { RepositoryConfigOut } from "@/api/types";
+import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
 
 function patternsToText(patterns: string[] | undefined): string {
   return (patterns ?? []).join("\n");
@@ -28,6 +28,7 @@ function textToPatterns(text: string): string[] {
 export default function RepositoryPage() {
   const { systemId } = useAuth();
   const { data: config, isLoading: configLoading } = useRepositoryConfig();
+  const { data: candidates, isLoading: candidatesLoading } = useRepositoryCandidates();
   const updateConfig = useUpdateRepositoryConfig();
   const { data: snapshots, isLoading: snapsLoading } = useSnapshots();
   const createSnapshot = useCreateSnapshot();
@@ -54,12 +55,13 @@ export default function RepositoryPage() {
               <CardDescription>Configure the target repository for analysis</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              {configLoading ? (
+              {configLoading || candidatesLoading ? (
                 <div className="space-y-3">{[1,2,3].map(i=><Skeleton key={i} className="h-10 w-full"/>)}</div>
               ) : (
                 <RepoConfigForm
                   key={configKey}
                   config={config ?? null}
+                  candidates={candidates ?? []}
                   onSave={async (data) => {
                     await updateConfig.mutateAsync(data);
                     toast.success("Repository config saved");
@@ -173,8 +175,9 @@ export default function RepositoryPage() {
   );
 }
 
-function RepoConfigForm({ config, onSave, isPending }: {
+function RepoConfigForm({ config, candidates, onSave, isPending }: {
   config: RepositoryConfigOut | null;
+  candidates: RepositoryCandidateOut[];
   onSave: (data: { repo_path: string; include_patterns: string[]; exclude_patterns: string[] }) => Promise<void>;
   isPending: boolean;
 }) {
@@ -195,8 +198,25 @@ function RepoConfigForm({ config, onSave, isPending }: {
   return (
     <>
       <div className="space-y-2">
-        <Label>Repository Path</Label>
-        <Input value={repoPath} onChange={e => setRepoPath(e.target.value)} placeholder="/path/to/repo" />
+        <Label>Repository</Label>
+        <Select value={repoPath} onChange={e => setRepoPath(e.target.value)}>
+          <option value="">Select repository...</option>
+          {config?.repo_path && !candidates.some(candidate => candidate.path === config.repo_path) && (
+            <option value={config.repo_path} disabled>
+              Unavailable: {config.repo_path}
+            </option>
+          )}
+          {candidates.map(candidate => (
+            <option key={candidate.path} value={candidate.path}>
+              {candidate.name} — {candidate.path}
+            </option>
+          ))}
+        </Select>
+        {!candidates.length && (
+          <p className="text-xs text-destructive">
+            No Git repositories were found below the configured repository root.
+          </p>
+        )}
       </div>
       <div className="space-y-2">
         <Label>Include Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
@@ -206,7 +226,7 @@ function RepoConfigForm({ config, onSave, isPending }: {
         <Label>Exclude Patterns <span className="text-muted-foreground font-normal">(one per line)</span></Label>
         <Textarea value={excludePatterns} onChange={e => setExcludePatterns(e.target.value)} placeholder={"test_*\n__pycache__"} rows={3} />
       </div>
-      <Button onClick={handleSave} disabled={isPending}>
+      <Button onClick={handleSave} disabled={isPending || !repoPath || !candidates.some(candidate => candidate.path === repoPath)}>
         {isPending ? "Saving..." : "Save Configuration"}
       </Button>
     </>

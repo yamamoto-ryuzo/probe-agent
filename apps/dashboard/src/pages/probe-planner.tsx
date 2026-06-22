@@ -1,15 +1,18 @@
 import {
   useProbePlans, useGenerateProbePlan, useUpdateProbePointStatus,
-  useProbePatches, useGeneratePatch, useValidatePatch,
+  useProbePatches, useGeneratePatch, useValidatePatch, useApplyProbePatch,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
-import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download } from "lucide-react";
+import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch } from "lucide-react";
 import { useState } from "react";
+import type { ProbePatchOut } from "@/api/types";
 
 export default function ProbePlannerPage() {
   const { data: plansData, isLoading } = useProbePlans();
@@ -18,7 +21,10 @@ export default function ProbePlannerPage() {
   const { data: patches } = useProbePatches();
   const generatePatch = useGeneratePatch();
   const validatePatch = useValidatePatch();
+  const applyPatch = useApplyProbePatch();
   const [expandedPlan, setExpandedPlan] = useState<number | null>(null);
+  const [applyTarget, setApplyTarget] = useState<ProbePatchOut | null>(null);
+  const [applyConfirmation, setApplyConfirmation] = useState("");
 
   const plans = plansData?.plans ?? [];
 
@@ -124,8 +130,8 @@ export default function ProbePlannerPage() {
                           <div key={patch.id} className="rounded-lg border p-3 space-y-2">
                             <div className="flex items-center justify-between">
                               <div className="flex items-center gap-2">
-                                <Badge variant={patch.status === "applied" ? "success" : patch.status === "failed" ? "destructive" : "secondary"}>
-                                  {patch.status}
+                                <Badge variant={patch.apply_status === "applied" ? "success" : patch.status === "failed" ? "destructive" : "secondary"}>
+                                  {patch.apply_status === "applied" ? "applied" : patch.status}
                                 </Badge>
                                 <span className="font-mono text-xs">{patch.commit_sha?.slice(0, 8)}</span>
                               </div>
@@ -138,6 +144,20 @@ export default function ProbePlannerPage() {
                                   <Play className="h-3 w-3 mr-1" />
                                   Validate
                                 </Button>
+                                {patch.apply_status !== "applied" && (
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    onClick={() => {
+                                      setApplyTarget(patch);
+                                      setApplyConfirmation("");
+                                    }}
+                                    disabled={applyPatch.isPending}
+                                  >
+                                    <GitBranch className="h-3 w-3 mr-1" />
+                                    Apply
+                                  </Button>
+                                )}
                                 {patch.diff && (
                                   <Button
                                     size="sm" variant="ghost"
@@ -158,6 +178,16 @@ export default function ProbePlannerPage() {
                               <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs font-mono max-h-64 overflow-y-auto">
                                 {patch.diff}
                               </pre>
+                            )}
+                            {patch.apply_status === "applied" && (
+                              <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/20 dark:text-emerald-200">
+                                Applied to the repository working tree. Review and commit the changes before creating a new snapshot.
+                              </div>
+                            )}
+                            {patch.apply_error && (
+                              <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800 dark:border-red-800 dark:bg-red-950/20 dark:text-red-200">
+                                Apply failed: {patch.apply_error}
+                              </div>
                             )}
                             {patch.validation_runs?.length > 0 && (
                               <div className="space-y-1">
@@ -184,6 +214,56 @@ export default function ProbePlannerPage() {
           })}
         </div>
       )}
+
+      <Dialog
+        open={applyTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) {
+            setApplyTarget(null);
+            setApplyConfirmation("");
+          }
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>Apply Probe Patch to Repository</DialogTitle>
+        </DialogHeader>
+        {applyTarget && (
+          <div className="space-y-4">
+            <div className="rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/20 dark:text-amber-100">
+              This writes the instrumentation patch directly to the source repository working tree. It does not create a commit.
+            </div>
+            <div className="space-y-1 text-sm">
+              <div>Snapshot commit: <code className="font-mono text-xs">{applyTarget.commit_sha}</code></div>
+              <div>The repository HEAD must match this commit and the working tree must be clean.</div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Type APPLY to confirm</label>
+              <Input
+                value={applyConfirmation}
+                onChange={e => setApplyConfirmation(e.target.value)}
+                placeholder="APPLY"
+              />
+            </div>
+            <Button
+              variant="destructive"
+              className="w-full"
+              disabled={applyConfirmation !== "APPLY" || applyPatch.isPending}
+              onClick={() => {
+                applyPatch.mutateAsync({
+                  patchId: applyTarget.id,
+                  expectedCommitSha: applyTarget.commit_sha,
+                }).then(() => {
+                  toast.success("Patch applied to repository");
+                  setApplyTarget(null);
+                  setApplyConfirmation("");
+                }).catch(e => toast.error(String(e)));
+              }}
+            >
+              {applyPatch.isPending ? "Applying..." : "Apply to Repository"}
+            </Button>
+          </div>
+        )}
+      </Dialog>
     </div>
   );
 }

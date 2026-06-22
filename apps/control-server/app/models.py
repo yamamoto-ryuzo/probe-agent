@@ -222,6 +222,11 @@ class RepositoryConfigUpdate(BaseModel):
     exclude_patterns: List[str] = Field(default_factory=lambda: [".env", "secrets/**", "data/**", "*.pem", "*.key", "credentials.*"])
 
 
+class RepositoryCandidateOut(BaseModel):
+    name: str
+    path: str
+
+
 class RepositoryConfigOut(BaseModel):
     system_id: int
     repo_path: str
@@ -614,6 +619,13 @@ class ProbePointStatusUpdate(BaseModel):
     status: ProbePointStatus
 
 
+class ProbePatchApplyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    confirmed: Literal[True]
+    expected_commit_sha: str = Field(..., min_length=7, max_length=64)
+
+
 class ValidationCommandOut(BaseModel):
     id: int
     command: str
@@ -657,6 +669,10 @@ class ProbePatchOut(BaseModel):
     error: Optional[str] = None
     cleanup_state: str = "not_attempted"
     cleanup_error: Optional[str] = None
+    apply_status: str = "not_applied"
+    apply_error: Optional[str] = None
+    applied_at: Optional[float] = None
+    applied_by_user_id: Optional[int] = None
     validation_runs: List[ValidationRunOut] = Field(default_factory=list)
     created_at: float
 

@@ -278,17 +278,19 @@ LLM_TIMEOUT=30
 `LLM_PROVIDER=mock` はローカルの疎通確認とテスト用で、外部 API は呼ばない。
 実際の評価には `openai` / `anthropic` / `gemini` のいずれかと API key を使う。
 
-Repository Understanding では、Control Server が読み取れる repository root を
-明示する。Compose は host 側の root を `/repositories` へ read-only mount する。
+Repository Understanding では、Control Server が読み取れる host 側の repository
+root を `.env` の秘密情報として指定する。Compose はこのrootをcontainer内の
+`/repositories`へmountする。AI解析はcommit済みGit objectだけを読み、未commit変更や
+untracked fileを入力に含めない。検証済みProbe PatchはDashboardで明示承認した場合だけ
+元Repositoryのworking treeへ適用できる。
 
 ```env
 PROBE_REPOSITORY_HOST_ROOT=/path/to/repositories
-PROBE_REPOSITORY_ROOTS=/repositories
 INTELLIGENCE_LLM_MODEL=gpt-5.4
 ```
 
-Dashboard へ入力する repository path は、Control Server から見える
-`/repositories/<repo>` 形式を使う。自由度のある draft 生成では reasoning model
+DashboardではControl Serverが`/repositories`配下から検出したGit Repositoryを
+選択する。自由度のある draft 生成では reasoning model
 以外を拒否し、LLM failure 時に heuristic へフォールバックしない。
 
 ## 認証と Dashboard のログイン方式
