@@ -2,7 +2,8 @@
 
 Creates a temporary git worktree from a pinned commit, instruments approved
 symbols with @probe decorators using Python AST, and produces a reviewable
-diff.  Never modifies the target repository's branch or working tree.
+diff. The target working tree is modified only through the separate,
+explicitly-confirmed apply boundary.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .git_ops import GitError, _run_git, _validate_repo_path
+from .git_ops import GitError, _run_git, _validate_repo_path, resolve_head
 
 
 @dataclass
@@ -277,6 +278,41 @@ def apply_unified_diff(worktree_path: str, diff: str) -> Optional[str]:
                 or "git apply failed"
             )
     return None
+
+
+def apply_patch_to_repository(
+    repo_path: str,
+    expected_commit_sha: str,
+    diff: str,
+) -> Optional[str]:
+    """Apply an approved patch to a clean repository working tree.
+
+    Repository reads remain pinned to committed Git objects. This function is
+    the explicit write boundary and refuses stale snapshots or a dirty working
+    tree so an approved diff cannot overwrite unrelated local work.
+    """
+    real_path = _validate_repo_path(repo_path)
+    current_head = resolve_head(real_path)
+    if current_head != expected_commit_sha:
+        return (
+            "Repository HEAD changed after the snapshot "
+            f"(expected {expected_commit_sha}, found {current_head})"
+        )
+
+    status = _run_git(
+        real_path,
+        ["status", "--porcelain", "--untracked-files=all"],
+        timeout=30,
+    )
+    if status.returncode != 0:
+        return (
+            status.stderr.decode("utf-8", errors="replace").strip()
+            or "Failed to inspect repository working tree"
+        )
+    if status.stdout.strip():
+        return "Repository working tree is not clean"
+
+    return apply_unified_diff(real_path, diff)
 
 
 def generate_patch(

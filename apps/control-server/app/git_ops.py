@@ -122,6 +122,40 @@ def _validate_repo_path(repo_path: str) -> str:
     return real
 
 
+def discover_repository_candidates(max_depth: int = 4) -> List[Tuple[str, str]]:
+    """Return Git repositories located below the configured allowed roots.
+
+    Symlinked directories are not traversed. Results contain the repository's
+    display path relative to its allowed root and its canonical absolute path.
+    """
+    candidates: List[Tuple[str, str]] = []
+    seen = set()
+    for root in _allowed_repository_roots():
+        if not os.path.isdir(root):
+            continue
+        root_real = os.path.realpath(root)
+        for current, dirs, _files in os.walk(root_real, followlinks=False):
+            relative = os.path.relpath(current, root_real)
+            depth = 0 if relative == "." else len(relative.split(os.sep))
+            dirs[:] = [
+                name
+                for name in dirs
+                if name != ".git"
+                and not os.path.islink(os.path.join(current, name))
+                and depth < max_depth
+            ]
+
+            if os.path.exists(os.path.join(current, ".git")):
+                real = os.path.realpath(current)
+                if real not in seen:
+                    label = os.path.basename(root_real) if relative == "." else relative
+                    candidates.append((label.replace(os.sep, "/"), real))
+                    seen.add(real)
+                dirs[:] = []
+
+    return sorted(candidates, key=lambda item: (item[0].lower(), item[1]))
+
+
 def _is_safe_git_path(path: str) -> bool:
     if not path or "\x00" in path or "\\" in path:
         return False

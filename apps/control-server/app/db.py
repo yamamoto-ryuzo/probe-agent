@@ -465,10 +465,15 @@ CREATE TABLE IF NOT EXISTS probe_patches (
     error                TEXT,
     cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
     cleanup_error        TEXT,
+    apply_status         TEXT NOT NULL DEFAULT 'not_applied',
+    apply_error          TEXT,
+    applied_at           REAL,
+    applied_by_user_id   INTEGER,
     created_at           REAL NOT NULL,
     FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
-    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (applied_by_user_id) REFERENCES users (id) ON DELETE SET NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_probe_patches_plan
@@ -812,6 +817,19 @@ def init_db() -> None:
             )
         if "cleanup_error" not in patch_columns:
             conn.execute("ALTER TABLE probe_patches ADD COLUMN cleanup_error TEXT")
+        if "apply_status" not in patch_columns:
+            conn.execute(
+                "ALTER TABLE probe_patches "
+                "ADD COLUMN apply_status TEXT NOT NULL DEFAULT 'not_applied'"
+            )
+        if "apply_error" not in patch_columns:
+            conn.execute("ALTER TABLE probe_patches ADD COLUMN apply_error TEXT")
+        if "applied_at" not in patch_columns:
+            conn.execute("ALTER TABLE probe_patches ADD COLUMN applied_at REAL")
+        if "applied_by_user_id" not in patch_columns:
+            conn.execute(
+                "ALTER TABLE probe_patches ADD COLUMN applied_by_user_id INTEGER"
+            )
         experiment_columns = _columns(conn, "experiments")
         if "human_decision_variant_key" not in experiment_columns:
             conn.execute(

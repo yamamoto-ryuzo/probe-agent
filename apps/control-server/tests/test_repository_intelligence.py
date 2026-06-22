@@ -115,6 +115,20 @@ def git_repo_with_secrets(git_repo):
 
 
 class TestRepositoryConfig:
+    def test_lists_git_repositories_below_allowed_root(
+        self, admin_client, git_repo
+    ):
+        token = _login(admin_client)
+        r = admin_client.get(
+            "/repository-candidates",
+            headers=_bearer(token),
+        )
+        assert r.status_code == 200
+        assert {
+            item["path"] for item in r.json()
+        } == {str(git_repo.resolve())}
+        assert r.json()[0]["name"] == git_repo.name
+
     def test_get_returns_none_when_not_configured(self, admin_client):
         token = _login(admin_client)
         system = _create_system(admin_client, token, "Unconfigured")
@@ -185,7 +199,6 @@ class TestRepositoryConfig:
             "/repository", headers=_headers(token, sys_b["id"])
         )
         assert r.json() is None
-
 
 # ---------------------------------------------------------------------------
 # Snapshot tests
