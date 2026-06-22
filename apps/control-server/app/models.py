@@ -762,3 +762,114 @@ class TokenOut(BaseModel):
 
 class TokenCreateResponse(TokenOut):
     token: str = Field(..., description="raw token, shown only once")
+
+
+WorkspaceMessageRole = Literal["user", "assistant", "system"]
+WorkspaceContextItemType = Literal[
+    "feature", "component", "trace", "experiment", "probe_plan"
+]
+WorkspaceProposalStatus = Literal["proposed", "accepted", "rejected", "superseded"]
+WorkspaceDecisionType = Literal["accepted", "rejected", "deferred"]
+
+
+class WorkspaceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1, max_length=200)
+    focus: str = Field(default="", max_length=500)
+    summary: str = Field(default="", max_length=5000)
+
+
+class WorkspaceOut(BaseModel):
+    id: int
+    system_id: int
+    title: str
+    focus: str
+    status: str
+    summary: str
+    created_at: float
+    updated_at: float
+
+
+class WorkspaceContextItemCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_type: WorkspaceContextItemType
+    item_id: str = Field(..., min_length=1, max_length=200)
+    label: str = Field(default="", max_length=300)
+
+
+class WorkspaceContextItemOut(BaseModel):
+    id: int
+    workspace_id: int
+    item_type: str
+    item_id: str
+    label: str
+    created_at: float
+
+
+class WorkspaceProposalInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proposal_type: str = Field(..., min_length=1, max_length=100)
+    title: str = Field(default="", max_length=300)
+    body: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceMessageCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: WorkspaceMessageRole
+    content: str = Field(..., min_length=1, max_length=20_000)
+    context_metadata: dict[str, Any] = Field(default_factory=dict)
+    proposals: List[WorkspaceProposalInput] = Field(default_factory=list)
+
+
+class WorkspaceMessageOut(BaseModel):
+    id: int
+    workspace_id: int
+    role: str
+    content: str
+    context_metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: float
+
+
+class WorkspaceDecisionOut(BaseModel):
+    id: int
+    proposal_id: int
+    decision: WorkspaceDecisionType
+    reason: str
+    decided_by_user_id: Optional[int] = None
+    created_at: float
+
+
+class WorkspaceProposalOut(BaseModel):
+    id: int
+    workspace_id: int
+    message_id: Optional[int] = None
+    proposal_type: str
+    title: str
+    body: dict[str, Any] = Field(default_factory=dict)
+    status: WorkspaceProposalStatus
+    decisions: List[WorkspaceDecisionOut] = Field(default_factory=list)
+    created_at: float
+    updated_at: float
+
+
+class WorkspaceProposalUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, max_length=300)
+    body: Optional[dict[str, Any]] = None
+
+
+class WorkspaceDecisionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="", max_length=2000)
+
+
+class WorkspaceDetailOut(WorkspaceOut):
+    messages: List[WorkspaceMessageOut] = Field(default_factory=list)
+    context_items: List[WorkspaceContextItemOut] = Field(default_factory=list)
+    proposals: List[WorkspaceProposalOut] = Field(default_factory=list)

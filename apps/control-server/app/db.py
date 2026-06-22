@@ -607,6 +607,91 @@ CREATE TABLE IF NOT EXISTS experiment_analyses (
     created_at           REAL,
     FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    focus         TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'active',
+    summary       TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_system
+    ON workspaces (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_messages (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id      INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    role              TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    context_metadata  TEXT NOT NULL DEFAULT '{}',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_messages_workspace
+    ON workspace_messages (workspace_id, id);
+
+CREATE TABLE IF NOT EXISTS workspace_context_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id  INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    item_type     TEXT NOT NULL,
+    item_id       TEXT NOT NULL,
+    label         TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_context_items_workspace
+    ON workspace_context_items (workspace_id, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_context_items_unique
+    ON workspace_context_items (workspace_id, item_type, item_id);
+
+CREATE TABLE IF NOT EXISTS workspace_proposals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id  INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    message_id    INTEGER,
+    proposal_type TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',
+    body          TEXT NOT NULL DEFAULT '{}',
+    status        TEXT NOT NULL DEFAULT 'proposed',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES workspace_messages (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_proposals_workspace
+    ON workspace_proposals (workspace_id, id);
+
+CREATE TABLE IF NOT EXISTS workspace_decisions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id         INTEGER NOT NULL,
+    workspace_id        INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    decision            TEXT NOT NULL,
+    reason              TEXT NOT NULL DEFAULT '',
+    decided_by_user_id  INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES workspace_proposals (id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_decisions_proposal
+    ON workspace_decisions (proposal_id, id DESC);
 """
 
 
