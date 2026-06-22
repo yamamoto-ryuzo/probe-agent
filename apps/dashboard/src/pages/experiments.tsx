@@ -1,7 +1,9 @@
 import { useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   useExperiments, useRunExperiment, useExperimentDecision,
   useCreateExperiment, useSnapshots, useLatestDrafts,
+  useWorkspaceProposalDraft,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -34,6 +36,11 @@ interface VariantInput {
 }
 
 export default function ExperimentsPage() {
+  const [searchParams] = useSearchParams();
+  const draftIdParam = searchParams.get("draft");
+  const workspaceIdParam = searchParams.get("workspace");
+  const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
+  const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
   const { data: experiments, isLoading } = useExperiments();
   const runExperiment = useRunExperiment();
   const makeDecision = useExperimentDecision();
@@ -42,39 +49,52 @@ export default function ExperimentsPage() {
   const { data: drafts } = useLatestDrafts();
   const [expandedId, setExpandedId] = useState<number | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [draftDismissed, setDraftDismissed] = useState(false);
 
-  const [newFeatureId, setNewFeatureId] = useState("");
-  const [newObjective, setNewObjective] = useState("");
+  const [newFeatureId, setNewFeatureId] = useState<string | null>(null);
+  const [newObjective, setNewObjective] = useState<string | null>(null);
   const [newSnapshotId, setNewSnapshotId] = useState<string>("");
-  const [variants, setVariants] = useState<VariantInput[]>([
-    { label: "", patch_text: "", risk_note: "" },
-    { label: "", patch_text: "", risk_note: "" },
-  ]);
+  const [variants, setVariants] = useState<VariantInput[] | null>(null);
 
   const readySnapshots = snapshots?.filter(s => s.status === "ready") ?? [];
   const features = drafts?.feature_drafts ?? [];
+  const draftVariants = workspaceDraft?.draft_type === "experiment_draft"
+    ? (workspaceDraft.payload.variant_summaries ?? []).map(summary => ({
+      label: summary,
+      patch_text: "",
+      risk_note: "",
+    }))
+    : [];
+  while (draftVariants.length < 2) {
+    draftVariants.push({ label: "", patch_text: "", risk_note: "" });
+  }
+  const formFeatureId = newFeatureId
+    ?? (workspaceDraft?.draft_type === "experiment_draft" ? workspaceDraft.payload.feature_id ?? "" : "");
+  const formObjective = newObjective
+    ?? (workspaceDraft?.draft_type === "experiment_draft" ? workspaceDraft.payload.objective ?? "" : "");
+  const formVariants = variants ?? draftVariants;
+  const draftOpen = !!workspaceDraft
+    && workspaceDraft.draft_type === "experiment_draft"
+    && !draftDismissed;
 
   const resetForm = () => {
-    setNewFeatureId("");
-    setNewObjective("");
+    setNewFeatureId(null);
+    setNewObjective(null);
     setNewSnapshotId("");
-    setVariants([
-      { label: "", patch_text: "", risk_note: "" },
-      { label: "", patch_text: "", risk_note: "" },
-    ]);
+    setVariants(null);
   };
 
   const handleCreate = async () => {
-    if (!newFeatureId || !newObjective.trim() || !newSnapshotId) return;
-    const validVariants = variants.filter(v => v.label.trim() && v.patch_text.trim());
+    if (!formFeatureId || !formObjective.trim() || !newSnapshotId) return;
+    const validVariants = formVariants.filter(v => v.label.trim() && v.patch_text.trim());
     if (validVariants.length < 2) {
       toast.error("At least two variants with label and patch are required");
       return;
     }
     try {
       await createExperiment.mutateAsync({
-        feature_id: newFeatureId,
-        objective: newObjective.trim(),
+        feature_id: formFeatureId,
+        objective: formObjective.trim(),
         snapshot_id: Number(newSnapshotId),
         variants: validVariants.map(v => ({
           label: v.label.trim(),
@@ -84,28 +104,38 @@ export default function ExperimentsPage() {
       });
       toast.success("Experiment created");
       setShowCreate(false);
+      setDraftDismissed(true);
       resetForm();
     } catch (err) { toast.error(String(err)); }
   };
 
   const updateVariant = (idx: number, field: keyof VariantInput, value: string) => {
-    setVariants(prev => prev.map((v, i) => i === idx ? { ...v, [field]: value } : v));
+    setVariants(formVariants.map((v, i) => i === idx ? { ...v, [field]: value } : v));
   };
 
   const addVariant = () => {
-    setVariants(prev => [...prev, { label: "", patch_text: "", risk_note: "" }]);
+    setVariants([...formVariants, { label: "", patch_text: "", risk_note: "" }]);
   };
 
   const removeVariant = (idx: number) => {
-    if (variants.length <= 2) return;
-    setVariants(prev => prev.filter((_, i) => i !== idx));
+    if (formVariants.length <= 2) return;
+    setVariants(formVariants.filter((_, i) => i !== idx));
   };
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-bold tracking-tight">Experiments</h1>
-        <Button size="sm" onClick={() => setShowCreate(true)}>
+        <Button size="sm" onClick={() => {
+          setDraftDismissed(true);
+          setNewFeatureId("");
+          setNewObjective("");
+          setVariants([
+            { label: "", patch_text: "", risk_note: "" },
+            { label: "", patch_text: "", risk_note: "" },
+          ]);
+          setShowCreate(true);
+        }}>
           <Plus className="h-4 w-4 mr-1" />
           New Experiment
         </Button>
@@ -130,25 +160,46 @@ export default function ExperimentsPage() {
         </div>
       )}
 
-      <Dialog open={showCreate} onOpenChange={(open) => { setShowCreate(open); if (!open) resetForm(); }}>
+      <Dialog open={showCreate || draftOpen} onOpenChange={(open) => {
+        setShowCreate(open);
+        if (!open) {
+          setDraftDismissed(true);
+          resetForm();
+        }
+      }}>
         <DialogHeader>
           <DialogTitle>Create Experiment</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 max-h-[60vh] overflow-y-auto">
+          {workspaceDraft?.draft_type === "experiment_draft" && (
+            <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
+              Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
+              {workspaceDraft.missing_fields.length > 0 && (
+                <span className="ml-1 text-muted-foreground">
+                  Complete: {workspaceDraft.missing_fields.join(", ")}.
+                </span>
+              )}
+              {workspaceIdParam && (
+                <Link className="ml-2 underline" to={`/workspaces?open=${workspaceIdParam}`}>
+                  Back to workspace
+                </Link>
+              )}
+            </div>
+          )}
           <div className="space-y-2">
             <Label>Feature</Label>
             {features.length > 0 ? (
-              <Select value={newFeatureId} onChange={e => setNewFeatureId(e.target.value)}>
+              <Select value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)}>
                 <option value="">Select feature...</option>
                 {features.map(f => <option key={f.feature_id} value={f.feature_id}>{f.feature_id} — {f.name}</option>)}
               </Select>
             ) : (
-              <Input value={newFeatureId} onChange={e => setNewFeatureId(e.target.value)} placeholder="feature-id" />
+              <Input value={formFeatureId} onChange={e => setNewFeatureId(e.target.value)} placeholder="feature-id" />
             )}
           </div>
           <div className="space-y-2">
             <Label>Objective</Label>
-            <Textarea value={newObjective} onChange={e => setNewObjective(e.target.value)} placeholder="What are you trying to learn?" rows={2} />
+            <Textarea value={formObjective} onChange={e => setNewObjective(e.target.value)} placeholder="What are you trying to learn?" rows={2} />
           </div>
           <div className="space-y-2">
             <Label>Snapshot</Label>
@@ -168,11 +219,11 @@ export default function ExperimentsPage() {
                 <Plus className="h-3 w-3 mr-1" /> Add
               </Button>
             </div>
-            {variants.map((v, i) => (
+            {formVariants.map((v, i) => (
               <div key={i} className="rounded-lg border p-3 space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-medium text-muted-foreground">Variant {i + 1}</span>
-                  {variants.length > 2 && (
+                  {formVariants.length > 2 && (
                     <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => removeVariant(i)}>
                       <Trash2 className="h-3 w-3" />
                     </Button>
@@ -200,7 +251,7 @@ export default function ExperimentsPage() {
           </div>
           <Button
             onClick={handleCreate}
-            disabled={createExperiment.isPending || !newFeatureId || !newObjective.trim() || !newSnapshotId || variants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2}
+            disabled={createExperiment.isPending || !formFeatureId || !formObjective.trim() || !newSnapshotId || formVariants.filter(v => v.label.trim() && v.patch_text.trim()).length < 2}
             className="w-full"
           >
             {createExperiment.isPending ? "Creating..." : "Create Experiment"}

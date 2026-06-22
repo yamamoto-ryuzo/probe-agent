@@ -768,7 +768,9 @@ WorkspaceMessageRole = Literal["user", "assistant", "system"]
 WorkspaceContextItemType = Literal[
     "feature", "component", "trace", "experiment", "probe_plan"
 ]
-WorkspaceProposalStatus = Literal["proposed", "accepted", "rejected", "superseded"]
+WorkspaceProposalStatus = Literal[
+    "proposed", "accepted", "rejected", "deferred", "superseded"
+]
 WorkspaceDecisionType = Literal["accepted", "rejected", "deferred"]
 
 

@@ -132,6 +132,7 @@ Summary: {feature_summary}
 User value: {feature_user_value}
 Success criteria: {feature_success_criteria}
 Risks: {feature_risks}
+Requested observation objective: {objective_hint}
 
 Accepted code links:
 {link_context}
@@ -261,6 +262,7 @@ def generate_probe_plan(
     feature_success_criteria: List[str],
     feature_risks: List[str],
     accepted_links: List[AcceptedLink],
+    objective_hint: str = "",
 ) -> PlanResult:
     is_mock = isinstance(client, MockLLMClient)
     if is_mock:
@@ -298,6 +300,7 @@ def generate_probe_plan(
         feature_user_value=feature_user_value,
         feature_success_criteria=", ".join(feature_success_criteria) or "none",
         feature_risks=", ".join(feature_risks) or "none",
+        objective_hint=objective_hint.strip() or "derive from the feature evidence",
         link_context=link_context,
     )
 

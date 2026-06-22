@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import {
   useWorkspaces, useWorkspace, useCreateWorkspace, useWorkspaceContextPack,
   useAddWorkspaceContextItem, useDeleteWorkspaceContextItem,
   useCreateWorkspaceAgentTurn, useAcceptWorkspaceProposal, useRejectWorkspaceProposal,
+  useDeferWorkspaceProposal, useCreateWorkspaceProposalDraft,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,7 @@ import { Select } from "@/components/ui/select";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
 import { formatTimestamp, cn } from "@/lib/utils";
-import { Plus, Send, Trash2, CheckCircle, XCircle, ExternalLink } from "lucide-react";
+import { Plus, Send, Trash2, CheckCircle, XCircle, ExternalLink, Clock3 } from "lucide-react";
 import type { WorkspaceContextItemType, WorkspaceProposalOut } from "@/api/types";
 
 const ITEM_TYPE_ROUTE: Record<string, string> = {
@@ -286,12 +287,15 @@ function MessageBubble({ message }: { message: { role: string; content: string; 
 }
 
 function ContextProposalsPane({ workspaceId }: { workspaceId: number | null }) {
+  const navigate = useNavigate();
   const { data: workspace } = useWorkspace(workspaceId);
   const { data: contextPack } = useWorkspaceContextPack(workspaceId);
   const addContextItem = useAddWorkspaceContextItem(workspaceId ?? -1);
   const deleteContextItem = useDeleteWorkspaceContextItem(workspaceId ?? -1);
   const acceptProposal = useAcceptWorkspaceProposal(workspaceId ?? -1);
   const rejectProposal = useRejectWorkspaceProposal(workspaceId ?? -1);
+  const deferProposal = useDeferWorkspaceProposal(workspaceId ?? -1);
+  const createDraft = useCreateWorkspaceProposalDraft(workspaceId ?? -1);
 
   const [showAddContext, setShowAddContext] = useState(false);
   const [newItemType, setNewItemType] = useState<WorkspaceContextItemType>("component");
@@ -379,7 +383,12 @@ function ContextProposalsPane({ workspaceId }: { workspaceId: number | null }) {
                 onReasonChange={(v) => setReasons(prev => ({ ...prev, [p.id]: v }))}
                 onAccept={() => acceptProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal accepted")).catch(e => toast.error(String(e)))}
                 onReject={() => rejectProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal rejected")).catch(e => toast.error(String(e)))}
-                isPending={acceptProposal.isPending || rejectProposal.isPending}
+                onDefer={() => deferProposal.mutateAsync({ proposalId: p.id, reason: reasons[p.id] }).then(() => toast.success("Proposal deferred")).catch(e => toast.error(String(e)))}
+                onCreateDraft={() => createDraft.mutateAsync(p.id).then(draft => {
+                  const target = draft.target_screen === "probe_planner" ? "/probe-planner" : "/experiments";
+                  navigate(`${target}?draft=${draft.id}&workspace=${workspaceId}`);
+                }).catch(e => toast.error(String(e)))}
+                isPending={acceptProposal.isPending || rejectProposal.isPending || deferProposal.isPending || createDraft.isPending}
               />
             ))
           )}
@@ -422,12 +431,14 @@ function ContextProposalsPane({ workspaceId }: { workspaceId: number | null }) {
   );
 }
 
-function ProposalCard({ proposal, reason, onReasonChange, onAccept, onReject, isPending }: {
+function ProposalCard({ proposal, reason, onReasonChange, onAccept, onReject, onDefer, onCreateDraft, isPending }: {
   proposal: WorkspaceProposalOut;
   reason: string;
   onReasonChange: (v: string) => void;
   onAccept: () => void;
   onReject: () => void;
+  onDefer: () => void;
+  onCreateDraft: () => void;
   isPending: boolean;
 }) {
   const decided = proposal.status !== "proposed";
@@ -462,14 +473,24 @@ function ProposalCard({ proposal, reason, onReasonChange, onAccept, onReject, is
             <Button size="sm" variant="outline" className="flex-1" onClick={onReject} disabled={isPending}>
               <XCircle className="h-3 w-3 mr-1 text-red-500" /> Reject
             </Button>
+            <Button size="sm" variant="outline" className="flex-1" onClick={onDefer} disabled={isPending}>
+              <Clock3 className="h-3 w-3 mr-1" /> Defer
+            </Button>
           </div>
         </div>
       ) : (
-        proposal.decisions.length > 0 && (
-          <p className="text-muted-foreground">
-            {proposal.decisions[proposal.decisions.length - 1].decision} — {proposal.decisions[proposal.decisions.length - 1].reason || "(no reason given)"}
-          </p>
-        )
+        <div className="space-y-2">
+          {proposal.decisions.length > 0 && (
+            <p className="text-muted-foreground">
+              {proposal.decisions[proposal.decisions.length - 1].decision} — {proposal.decisions[proposal.decisions.length - 1].reason || "(no reason given)"}
+            </p>
+          )}
+          {proposal.status === "accepted" && (
+            <Button size="sm" className="w-full" onClick={onCreateDraft} disabled={isPending}>
+              Open editable draft
+            </Button>
+          )}
+        </div>
       )}
     </div>
   );

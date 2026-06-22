@@ -1,6 +1,7 @@
 import {
   useProbePlans, useGenerateProbePlan, useUpdateProbePointStatus,
   useProbePatches, useGeneratePatch, useValidatePatch, useApplyProbePatch,
+  useLatestDrafts, useWorkspaceProposalDraft,
 } from "@/api/hooks";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -8,14 +9,24 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Dialog, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { toast } from "sonner";
 import { formatTimestamp } from "@/lib/utils";
 import { Crosshair, CheckCircle, XCircle, FileCode, Play, Download, GitBranch } from "lucide-react";
 import { useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import type { ProbePatchOut } from "@/api/types";
 import { AddToWorkspaceButton } from "@/components/add-to-workspace";
 
 export default function ProbePlannerPage() {
+  const [searchParams] = useSearchParams();
+  const draftIdParam = searchParams.get("draft");
+  const workspaceIdParam = searchParams.get("workspace");
+  const draftId = draftIdParam && Number.isInteger(Number(draftIdParam)) ? Number(draftIdParam) : null;
+  const { data: workspaceDraft } = useWorkspaceProposalDraft(draftId);
+  const { data: featureDrafts } = useLatestDrafts();
   const { data: plansData, isLoading } = useProbePlans();
   const generatePlan = useGenerateProbePlan();
   const updatePointStatus = useUpdateProbePointStatus();
@@ -26,8 +37,37 @@ export default function ProbePlannerPage() {
   const [expandedPlan, setExpandedPlan] = useState<number | null>(null);
   const [applyTarget, setApplyTarget] = useState<ProbePatchOut | null>(null);
   const [applyConfirmation, setApplyConfirmation] = useState("");
+  const [showGenerate, setShowGenerate] = useState(false);
+  const [draftDismissed, setDraftDismissed] = useState(false);
+  const [featureId, setFeatureId] = useState<string | null>(null);
+  const [objective, setObjective] = useState<string | null>(null);
 
   const plans = plansData?.plans ?? [];
+  const features = featureDrafts?.feature_drafts ?? [];
+  const formFeatureId = featureId
+    ?? (workspaceDraft?.draft_type === "probe_plan_draft" ? workspaceDraft.payload.feature_id ?? "" : "");
+  const formObjective = objective
+    ?? (workspaceDraft?.draft_type === "probe_plan_draft" ? workspaceDraft.payload.objective ?? "" : "");
+  const draftOpen = !!workspaceDraft
+    && workspaceDraft.draft_type === "probe_plan_draft"
+    && !draftDismissed;
+
+  const generate = async () => {
+    if (!formFeatureId.trim()) return;
+    try {
+      await generatePlan.mutateAsync({
+        featureId: formFeatureId.trim(),
+        objective: formObjective.trim() || undefined,
+      });
+      toast.success("Plan generated");
+      setShowGenerate(false);
+      setDraftDismissed(true);
+      setFeatureId(null);
+      setObjective(null);
+    } catch (e) {
+      toast.error(String(e));
+    }
+  };
 
   return (
     <div className="space-y-6">
@@ -35,7 +75,12 @@ export default function ProbePlannerPage() {
         <h1 className="text-2xl font-bold tracking-tight">Probe Planner</h1>
         <Button
           size="sm"
-          onClick={() => generatePlan.mutateAsync().then(() => toast.success("Plan generated")).catch(e => toast.error(String(e)))}
+          onClick={() => {
+            setDraftDismissed(true);
+            setFeatureId("");
+            setObjective("");
+            setShowGenerate(true);
+          }}
           disabled={generatePlan.isPending}
         >
           <Crosshair className="h-4 w-4 mr-1" />
@@ -220,6 +265,66 @@ export default function ProbePlannerPage() {
           })}
         </div>
       )}
+
+      <Dialog
+        open={showGenerate || draftOpen}
+        onOpenChange={(open) => {
+          setShowGenerate(open);
+          if (!open) {
+            setDraftDismissed(true);
+            setFeatureId(null);
+            setObjective(null);
+          }
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>Generate Probe Plan</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          {workspaceDraft?.draft_type === "probe_plan_draft" && (
+            <div className="rounded-md border bg-secondary/30 px-3 py-2 text-xs">
+              Prefilled from Decision Workspace proposal #{workspaceDraft.proposal_id}.
+              {workspaceDraft.missing_fields.length > 0 && (
+                <span className="ml-1 text-muted-foreground">
+                  Missing prerequisites: {workspaceDraft.missing_fields.join(", ")}.
+                </span>
+              )}
+              {workspaceIdParam && (
+                <Link className="ml-2 underline" to={`/workspaces?open=${workspaceIdParam}`}>
+                  Back to workspace
+                </Link>
+              )}
+            </div>
+          )}
+          <div className="space-y-2">
+            <Label>Feature</Label>
+            {features.length > 0 ? (
+              <Select value={formFeatureId} onChange={e => setFeatureId(e.target.value)}>
+                <option value="">Select feature...</option>
+                {features.map(feature => (
+                  <option key={feature.feature_id} value={feature.feature_id}>
+                    {feature.feature_id} — {feature.name}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <Input value={formFeatureId} onChange={e => setFeatureId(e.target.value)} placeholder="feature-id" />
+            )}
+          </div>
+          <div className="space-y-2">
+            <Label>Observation objective</Label>
+            <Textarea
+              value={formObjective}
+              onChange={e => setObjective(e.target.value)}
+              placeholder="What should this probe plan help determine?"
+              rows={3}
+            />
+          </div>
+          <Button className="w-full" onClick={generate} disabled={!formFeatureId.trim() || generatePlan.isPending}>
+            {generatePlan.isPending ? "Generating..." : "Generate Plan"}
+          </Button>
+        </div>
+      </Dialog>
 
       <Dialog
         open={applyTarget !== null}

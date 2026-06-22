@@ -95,7 +95,11 @@ def test_workspace_messages_are_stored_in_order(admin_client):
                 {
                     "proposal_type": "experiment_draft",
                     "title": "Try a longer prompt",
-                    "body": {"variant": "longer-prompt"},
+                    "body": {
+                        "feature_id": "summarization",
+                        "objective": "compare prompt variants",
+                        "variant_summaries": ["longer-prompt"],
+                    },
                 }
             ],
         },
@@ -121,8 +125,16 @@ def test_context_items_add_dedupe_and_delete(admin_client):
     workspace = admin_client.post(
         "/workspaces", json={"title": "Theme"}, headers=headers
     ).json()
+    from app.db import get_conn
 
-    payload = {"item_type": "feature", "item_id": "summarization", "label": "Summarization"}
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO components (system_id, component_id, mode, updated_at)
+               VALUES (?, 'summarizer', 'trace', 1)""",
+            (system_id,),
+        )
+
+    payload = {"item_type": "component", "item_id": "summarizer", "label": "Summarizer"}
     r = admin_client.post(
         f"/workspaces/{workspace['id']}/context", json=payload, headers=headers
     )
@@ -153,13 +165,25 @@ def test_context_items_add_dedupe_and_delete(admin_client):
 
 
 def _create_proposal(admin_client, headers, workspace_id, proposal_type="experiment_draft"):
+    if proposal_type == "experiment_draft":
+        body = {
+            "feature_id": "summarization",
+            "objective": "compare variants",
+            "variant_summaries": [],
+        }
+    else:
+        body = {
+            "feature_id": "summarization",
+            "objective": "observe behavior",
+            "target_components": [],
+        }
     r = admin_client.post(
         f"/workspaces/{workspace_id}/messages",
         json={
             "role": "assistant",
             "content": "proposal message",
             "proposals": [
-                {"proposal_type": proposal_type, "title": "t", "body": {"k": "v"}}
+                {"proposal_type": proposal_type, "title": "t", "body": body}
             ],
         },
         headers=headers,
@@ -225,6 +249,52 @@ def test_proposal_reject_then_accept_conflicts(admin_client):
     assert r.json()["decisions"][0]["reason"] == "not worth the risk"
 
 
+def test_proposal_can_be_deferred_with_decision_history(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    workspace = admin_client.post(
+        "/workspaces", json={"title": "Theme"}, headers=headers
+    ).json()
+    proposal = _create_proposal(admin_client, headers, workspace["id"])
+
+    r = admin_client.post(
+        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}/defer",
+        json={"reason": "need more traces"},
+        headers=headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "deferred"
+    assert r.json()["decisions"][0]["decision"] == "deferred"
+
+
+def test_invalid_proposal_is_rejected_at_message_boundary(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    workspace = admin_client.post(
+        "/workspaces", json={"title": "Theme"}, headers=headers
+    ).json()
+
+    r = admin_client.post(
+        f"/workspaces/{workspace['id']}/messages",
+        json={
+            "role": "assistant",
+            "content": "bad proposal",
+            "proposals": [
+                {
+                    "proposal_type": "experiment_draft",
+                    "title": "invalid",
+                    "body": {"objective": "missing feature"},
+                }
+            ],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 422
+    detail = admin_client.get(f"/workspaces/{workspace['id']}", headers=headers).json()
+    assert detail["messages"] == []
+    assert detail["proposals"] == []
+
+
 def test_proposal_patch_only_allowed_while_proposed(admin_client):
     token, system_id = _setup(admin_client)
     headers = _headers(token, system_id)
@@ -273,6 +343,21 @@ def test_workspaces_and_context_are_system_scoped(admin_client):
         f"/workspaces/{workspace['id']}/messages",
         json={"role": "user", "content": "hello"},
         headers=headers_b,
+    )
+    assert r.status_code == 404
+
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO components (system_id, component_id, mode, updated_at)
+               VALUES (?, 'b-only', 'trace', 1)""",
+            (system_b,),
+        )
+    r = admin_client.post(
+        f"/workspaces/{workspace['id']}/context",
+        json={"item_type": "component", "item_id": "b-only"},
+        headers=headers_a,
     )
     assert r.status_code == 404
 

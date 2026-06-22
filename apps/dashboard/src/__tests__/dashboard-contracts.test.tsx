@@ -517,4 +517,51 @@ describe("Decision Workspace page", () => {
       expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/accept", { reason: "Looks promising" });
     });
   });
+
+  test("creates an editable handoff draft for an accepted proposal", async () => {
+    setupWorkspaceMocks({
+      detail: {
+        id: 1, system_id: 1, title: "Theme", focus: "", status: "active", summary: "",
+        created_at: 1, updated_at: 1, messages: [], context_items: [],
+        proposals: [{
+          id: 5, workspace_id: 1, message_id: 1, proposal_type: "experiment_draft",
+          title: "Compare variants",
+          body: { feature_id: "feat-1", objective: "compare quality" },
+          status: "accepted",
+          decisions: [{
+            id: 9, proposal_id: 5, decision: "accepted", reason: "try it",
+            decided_by_user_id: 1, created_at: 1,
+          }],
+          created_at: 1, updated_at: 1,
+        }],
+      },
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/workspaces/1/proposals/5/draft") {
+        return Promise.resolve({
+          id: 7,
+          workspace_id: 1,
+          proposal_id: 5,
+          system_id: 1,
+          draft_type: "experiment_draft",
+          target_screen: "experiments",
+          payload: { feature_id: "feat-1", objective: "compare quality" },
+          missing_fields: ["snapshot_id", "patch_text"],
+          created_at: 1,
+        });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: WorkspacesPage } = await import("@/pages/workspaces");
+    render(<WorkspacesPage />, { wrapper: createWrapper() });
+
+    await waitFor(() => expect(screen.getByText("Theme")).toBeInTheDocument());
+    fireEvent.click(screen.getByText("Theme"));
+    fireEvent.click(await screen.findByText("Open editable draft"));
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/workspaces/1/proposals/5/draft");
+    });
+  });
 });

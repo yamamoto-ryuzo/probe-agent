@@ -10,6 +10,7 @@ import type {
   SystemProfile,
   WorkspaceOut, WorkspaceDetailOut, WorkspaceContextItemOut,
   WorkspaceContextPack, WorkspaceAgentTurnOut, WorkspaceProposalOut,
+  WorkspaceProposalDraftOut,
 } from "./types";
 
 function sysKey(base: string) {
@@ -283,7 +284,11 @@ export function useProbePlans() {
 export function useGenerateProbePlan() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: () => api.post("/repository/probe-plans/generate"),
+    mutationFn: ({ featureId, objective }: { featureId: string; objective?: string }) => {
+      const query = new URLSearchParams({ feature_id: featureId });
+      if (objective?.trim()) query.set("objective", objective.trim());
+      return api.post(`/repository/probe-plans/generate?${query.toString()}`);
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });
 }
@@ -476,6 +481,35 @@ export function useRejectWorkspaceProposal(workspaceId: number) {
     mutationFn: ({ proposalId, reason }: { proposalId: number; reason?: string }) =>
       api.post<WorkspaceProposalOut>(`/workspaces/${workspaceId}/proposals/${proposalId}/reject`, { reason: reason ?? "" }),
     onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] }),
+  });
+}
+
+export function useDeferWorkspaceProposal(workspaceId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ proposalId, reason }: { proposalId: number; reason?: string }) =>
+      api.post<WorkspaceProposalOut>(
+        `/workspaces/${workspaceId}/proposals/${proposalId}/defer`,
+        { reason: reason ?? "" },
+      ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: [...sysKey("workspace"), workspaceId] }),
+  });
+}
+
+export function useCreateWorkspaceProposalDraft(workspaceId: number) {
+  return useMutation({
+    mutationFn: (proposalId: number) =>
+      api.post<WorkspaceProposalDraftOut>(
+        `/workspaces/${workspaceId}/proposals/${proposalId}/draft`,
+      ),
+  });
+}
+
+export function useWorkspaceProposalDraft(draftId: number | null) {
+  return useQuery({
+    queryKey: [...sysKey("workspaceDraft"), draftId],
+    queryFn: () => api.get<WorkspaceProposalDraftOut>(`/workspace-drafts/${draftId}`),
+    enabled: !!draftId && !!getSystemId(),
   });
 }
 

@@ -16,6 +16,7 @@ for the system".
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from typing import List, Optional
 
@@ -45,12 +46,27 @@ MAX_VARIANTS_PER_EXPERIMENT = 10
 MAX_TRACES_SCANNED_PER_COMPONENT = 200
 MAX_FAILURE_REASONS = 3
 
+_SENSITIVE_VALUE_PATTERNS = [
+    re.compile(
+        r'(?i)(["\']?(?:api[_-]?key|access[_-]?token|password|passwd|secret)'
+        r'["\']?\s*[:=]\s*["\']?)([^"\'\s,}]+)'
+    ),
+    re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)([^\s,\"'}]+)"),
+]
+
 
 def _truncate(text: Optional[str], limit: int = MAX_TEXT_CHARS) -> str:
     text = text or ""
     if len(text) <= limit:
         return text
     return text[: max(limit - 1, 0)].rstrip() + "…"
+
+
+def _redact_and_truncate(text: Optional[str], limit: int = MAX_TEXT_CHARS) -> str:
+    redacted = text or ""
+    for pattern in _SENSITIVE_VALUE_PATTERNS:
+        redacted = pattern.sub(r"\1[REDACTED]", redacted)
+    return _truncate(redacted, limit)
 
 
 def _json_list(raw) -> list:
@@ -261,7 +277,9 @@ def _trace_digest(
     representative = rows[0]
     representative_input = None
     if representative["input_json"] is not None:
-        representative_input = _truncate(str(representative["input_json"]))
+        representative_input = _redact_and_truncate(
+            str(representative["input_json"])
+        )
 
     failed_trace_ids = {r["trace_id"] for r in rows}
     eval_failed_count = 0
@@ -291,7 +309,7 @@ def _trace_digest(
         error_count=error_count,
         eval_failed_count=eval_failed_count,
         representative_input=representative_input,
-        representative_output=_truncate(representative["output_text"])
+        representative_output=_redact_and_truncate(representative["output_text"])
         if representative["output_text"]
         else None,
         evidence=builder.add_evidence(evidence_refs),

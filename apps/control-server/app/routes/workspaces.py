@@ -18,6 +18,7 @@ from dataclasses import replace
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import ValidationError
 
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
@@ -40,7 +41,11 @@ from ..models import (
     WorkspaceProposalUpdate,
 )
 from ..workspace_actions import UnsupportedProposalTypeError, build_proposal_draft
-from ..workspace_agent import AgentTurnResult, generate_agent_turn
+from ..workspace_agent import (
+    PROPOSAL_BODY_MODELS,
+    AgentTurnResult,
+    generate_agent_turn,
+)
 from ..workspace_context import build_context_pack
 
 router = APIRouter()
@@ -177,6 +182,71 @@ def _get_proposal_or_404(conn, workspace_id: int, proposal_id: int, system_id: i
     return row
 
 
+def _validate_context_ref(
+    conn,
+    system_id: int,
+    item_type: str,
+    item_id: str,
+) -> None:
+    if item_type == "feature":
+        row = conn.execute(
+            """SELECT 1 FROM feature_drafts
+               WHERE system_id = ? AND feature_id = ? LIMIT 1""",
+            (system_id, item_id),
+        ).fetchone()
+    elif item_type in {"component", "trace"}:
+        row = conn.execute(
+            """SELECT 1 FROM components
+               WHERE system_id = ? AND component_id = ?
+               UNION
+               SELECT 1 FROM component_profiles
+               WHERE system_id = ? AND component_id = ?
+               LIMIT 1""",
+            (system_id, item_id, system_id, item_id),
+        ).fetchone()
+    elif item_type == "experiment":
+        row = (
+            conn.execute(
+                "SELECT 1 FROM experiments WHERE system_id = ? AND id = ?",
+                (system_id, int(item_id)),
+            ).fetchone()
+            if item_id.isdigit()
+            else None
+        )
+    elif item_type == "probe_plan":
+        row = (
+            conn.execute(
+                "SELECT 1 FROM probe_plans WHERE system_id = ? AND id = ?",
+                (system_id, int(item_id)),
+            ).fetchone()
+            if item_id.isdigit()
+            else None
+        )
+    else:  # The Pydantic input model should make this unreachable.
+        row = None
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"{item_type} context item not found for this system",
+        )
+
+
+def _validated_proposal_body(proposal_type: str, body: dict) -> dict:
+    body_model = PROPOSAL_BODY_MODELS.get(proposal_type)
+    if body_model is None:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unsupported workspace proposal type: {proposal_type}",
+        )
+    try:
+        return body_model.model_validate(body).model_dump()
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid {proposal_type} proposal body: {exc}",
+        ) from exc
+
+
 @router.get("/workspaces", response_model=List[WorkspaceOut])
 def list_workspaces(system_id: int = Depends(get_system_id)) -> List[WorkspaceOut]:
     with get_conn() as conn:
@@ -286,6 +356,8 @@ def create_workspace_agent_turn(
     with get_conn() as conn:
         workspace = _get_workspace_or_404(conn, workspace_id, system_id)
         for ref in payload.context_refs:
+            _validate_context_ref(conn, system_id, ref.type, ref.id)
+        for ref in payload.context_refs:
             _pin_context_item(conn, workspace_id, system_id, ref.type, ref.id, "", now)
 
         history_rows = conn.execute(
@@ -339,68 +411,78 @@ def create_workspace_agent_turn(
 
     now = time.time()
     with get_conn() as conn:
-        assistant_metadata = {
-            "grounded_findings": [
-                {
-                    "claim": f.claim,
-                    "source_type": f.source_type,
-                    "source_id": f.source_id,
-                }
-                for f in result.grounded_findings
-            ],
-            "assumptions": result.assumptions,
-            "missing_information": result.missing_information,
-            "next_questions": result.next_questions,
-            "provider": result.provider,
-            "model": result.model,
-        }
-        cur = conn.execute(
-            """
-            INSERT INTO workspace_messages
-                (workspace_id, system_id, role, content, context_metadata, created_at)
-            VALUES (?, ?, 'assistant', ?, ?, ?)
-            """,
-            (
-                workspace_id,
-                system_id,
-                result.assistant_message,
-                json.dumps(assistant_metadata, ensure_ascii=False),
-                now,
-            ),
-        )
-        assistant_message_id = cur.lastrowid
-        proposal_outs: List[WorkspaceProposalOut] = []
-        for proposal in result.proposals:
+        _get_workspace_or_404(conn, workspace_id, system_id)
+        conn.execute("BEGIN")
+        try:
+            assistant_metadata = {
+                "grounded_findings": [
+                    {
+                        "claim": f.claim,
+                        "source_type": f.source_type,
+                        "source_id": f.source_id,
+                    }
+                    for f in result.grounded_findings
+                ],
+                "assumptions": result.assumptions,
+                "missing_information": result.missing_information,
+                "next_questions": result.next_questions,
+                "provider": result.provider,
+                "model": result.model,
+            }
             cur = conn.execute(
                 """
-                INSERT INTO workspace_proposals
-                    (workspace_id, system_id, message_id, proposal_type, title,
-                     body, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                INSERT INTO workspace_messages
+                    (workspace_id, system_id, role, content, context_metadata, created_at)
+                VALUES (?, ?, 'assistant', ?, ?, ?)
                 """,
                 (
                     workspace_id,
                     system_id,
-                    assistant_message_id,
-                    proposal.proposal_type,
-                    proposal.title,
-                    json.dumps(proposal.body, ensure_ascii=False),
-                    now,
+                    result.assistant_message,
+                    json.dumps(assistant_metadata, ensure_ascii=False),
                     now,
                 ),
             )
-            proposal_row = conn.execute(
-                "SELECT * FROM workspace_proposals WHERE id = ?", (cur.lastrowid,)
-            ).fetchone()
-            proposal_outs.append(_proposal_out(conn, proposal_row))
+            assistant_message_id = cur.lastrowid
+            proposal_outs: List[WorkspaceProposalOut] = []
+            for proposal in result.proposals:
+                body = _validated_proposal_body(
+                    proposal.proposal_type, proposal.body
+                )
+                cur = conn.execute(
+                    """
+                    INSERT INTO workspace_proposals
+                        (workspace_id, system_id, message_id, proposal_type, title,
+                         body, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        system_id,
+                        assistant_message_id,
+                        proposal.proposal_type,
+                        proposal.title,
+                        json.dumps(body, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+                proposal_row = conn.execute(
+                    "SELECT * FROM workspace_proposals WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+                proposal_outs.append(_proposal_out(conn, proposal_row))
 
-        assistant_message_row = conn.execute(
-            "SELECT * FROM workspace_messages WHERE id = ?", (assistant_message_id,)
-        ).fetchone()
-        conn.execute(
-            "UPDATE workspaces SET updated_at = ? WHERE id = ?",
-            (now, workspace_id),
-        )
+            assistant_message_row = conn.execute(
+                "SELECT * FROM workspace_messages WHERE id = ?", (assistant_message_id,)
+            ).fetchone()
+            conn.execute(
+                "UPDATE workspaces SET updated_at = ? WHERE id = ? AND system_id = ?",
+                (now, workspace_id, system_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
     return WorkspaceAgentTurnOut(
         user_message=user_message_out,
@@ -423,48 +505,66 @@ def create_workspace_message(
     now = time.time()
     with get_conn() as conn:
         _get_workspace_or_404(conn, workspace_id, system_id)
-        cur = conn.execute(
-            """
-            INSERT INTO workspace_messages
-                (workspace_id, system_id, role, content, context_metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
+        if payload.proposals and payload.role != "assistant":
+            raise HTTPException(
+                status_code=422,
+                detail="Only assistant messages may contain proposals",
+            )
+        validated_proposals = [
             (
-                workspace_id,
-                system_id,
-                payload.role,
-                payload.content,
-                json.dumps(payload.context_metadata, ensure_ascii=False),
-                now,
-            ),
-        )
-        message_id = cur.lastrowid
-        for proposal in payload.proposals:
-            conn.execute(
+                proposal,
+                _validated_proposal_body(proposal.proposal_type, proposal.body),
+            )
+            for proposal in payload.proposals
+        ]
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
                 """
-                INSERT INTO workspace_proposals
-                    (workspace_id, system_id, message_id, proposal_type, title,
-                     body, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                INSERT INTO workspace_messages
+                    (workspace_id, system_id, role, content, context_metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     workspace_id,
                     system_id,
-                    message_id,
-                    proposal.proposal_type,
-                    proposal.title,
-                    json.dumps(proposal.body, ensure_ascii=False),
-                    now,
+                    payload.role,
+                    payload.content,
+                    json.dumps(payload.context_metadata, ensure_ascii=False),
                     now,
                 ),
             )
-        conn.execute(
-            "UPDATE workspaces SET updated_at = ? WHERE id = ?",
-            (now, workspace_id),
-        )
-        row = conn.execute(
-            "SELECT * FROM workspace_messages WHERE id = ?", (message_id,)
-        ).fetchone()
+            message_id = cur.lastrowid
+            for proposal, body in validated_proposals:
+                conn.execute(
+                    """
+                    INSERT INTO workspace_proposals
+                        (workspace_id, system_id, message_id, proposal_type, title,
+                         body, status, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    """,
+                    (
+                        workspace_id,
+                        system_id,
+                        message_id,
+                        proposal.proposal_type,
+                        proposal.title,
+                        json.dumps(body, ensure_ascii=False),
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute(
+                "UPDATE workspaces SET updated_at = ? WHERE id = ? AND system_id = ?",
+                (now, workspace_id, system_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workspace_messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
         return _message_out(row)
 
 
@@ -481,6 +581,9 @@ def add_workspace_context_item(
     now = time.time()
     with get_conn() as conn:
         _get_workspace_or_404(conn, workspace_id, system_id)
+        _validate_context_ref(
+            conn, system_id, payload.item_type, payload.item_id
+        )
         _pin_context_item(
             conn, workspace_id, system_id, payload.item_type, payload.item_id,
             payload.label, now,
@@ -576,27 +679,35 @@ def _resolve_decision(
             status_code=409,
             detail=f"Proposal is already {proposal['status']} and cannot be {decision_type}",
         )
-    conn.execute(
-        """
-        INSERT INTO workspace_decisions
-            (proposal_id, workspace_id, system_id, decision, reason,
-             decided_by_user_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            proposal_id,
-            workspace_id,
-            system_id,
-            decision_type,
-            payload.reason,
-            principal.user_id,
-            now,
-        ),
-    )
-    conn.execute(
-        "UPDATE workspace_proposals SET status = ?, updated_at = ? WHERE id = ?",
-        (target_status, now, proposal_id),
-    )
+    conn.execute("BEGIN")
+    try:
+        conn.execute(
+            """
+            INSERT INTO workspace_decisions
+                (proposal_id, workspace_id, system_id, decision, reason,
+                 decided_by_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proposal_id,
+                workspace_id,
+                system_id,
+                decision_type,
+                payload.reason,
+                principal.user_id,
+                now,
+            ),
+        )
+        conn.execute(
+            """UPDATE workspace_proposals
+               SET status = ?, updated_at = ?
+               WHERE id = ? AND status = 'proposed'""",
+            (target_status, now, proposal_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
     row = _get_proposal_or_404(conn, workspace_id, proposal_id, system_id)
     return _proposal_out(conn, row)
 
@@ -640,6 +751,25 @@ def reject_workspace_proposal(
 
 
 @router.post(
+    "/workspaces/{workspace_id}/proposals/{proposal_id}/defer",
+    response_model=WorkspaceProposalOut,
+)
+def defer_workspace_proposal(
+    workspace_id: int,
+    proposal_id: int,
+    payload: WorkspaceDecisionCreate,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
+) -> WorkspaceProposalOut:
+    with get_conn() as conn:
+        _get_workspace_or_404(conn, workspace_id, system_id)
+        return _resolve_decision(
+            conn, workspace_id, proposal_id, system_id, "deferred", "deferred",
+            payload, principal,
+        )
+
+
+@router.post(
     "/workspaces/{workspace_id}/proposals/{proposal_id}/draft",
     response_model=WorkspaceProposalDraftOut,
     status_code=201,
@@ -648,6 +778,7 @@ def create_workspace_proposal_draft(
     workspace_id: int,
     proposal_id: int,
     system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(get_principal),
 ) -> WorkspaceProposalDraftOut:
     """Build (or return the existing) deterministic prefill draft for an
     accepted proposal, for the destination screen (Probe Planner or
@@ -683,8 +814,8 @@ def create_workspace_proposal_draft(
             """
             INSERT INTO workspace_proposal_drafts
                 (workspace_id, proposal_id, system_id, draft_type, target_screen,
-                 payload, missing_fields, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 payload, missing_fields, created_by_user_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 workspace_id,
@@ -694,6 +825,7 @@ def create_workspace_proposal_draft(
                 draft.target_screen,
                 json.dumps(draft.payload, ensure_ascii=False),
                 json.dumps(draft.missing_fields, ensure_ascii=False),
+                principal.user_id,
                 now,
             ),
         )

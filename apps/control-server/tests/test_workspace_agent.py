@@ -347,3 +347,27 @@ def test_agent_turn_pins_requested_context_refs(admin_client, monkeypatch):
     detail = admin_client.get(f"/workspaces/{workspace['id']}", headers=headers).json()
     assert len(detail["context_items"]) == 1
     assert detail["context_items"][0]["item_id"] == "summarizer"
+
+
+def test_agent_turn_does_not_partially_pin_invalid_context_refs(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    _seed_component(system_id)
+    workspace = _create_workspace(admin_client, headers)
+
+    r = admin_client.post(
+        f"/workspaces/{workspace['id']}/agent-turns",
+        json={
+            "message": "Hello",
+            "context_refs": [
+                {"type": "component", "id": "summarizer"},
+                {"type": "component", "id": "missing-component"},
+            ],
+        },
+        headers=headers,
+    )
+    assert r.status_code == 404
+
+    detail = admin_client.get(f"/workspaces/{workspace['id']}", headers=headers).json()
+    assert detail["context_items"] == []
+    assert detail["messages"] == []

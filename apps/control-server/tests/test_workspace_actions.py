@@ -238,20 +238,25 @@ def test_probe_plan_draft_missing_fields_when_prerequisites_satisfied(admin_clie
 def test_invalid_proposal_body_rejected(admin_client):
     token, system_id = _setup(admin_client)
     headers = _headers(token, system_id)
-    workspace, proposal = _create_workspace_with_proposal(
-        admin_client, headers, "experiment_draft", {"k": "v"},
-    )
-    admin_client.post(
-        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}/accept",
-        json={"reason": "go"},
-        headers=headers,
-    )
-
+    workspace = admin_client.post(
+        "/workspaces", json={"title": "Theme"}, headers=headers
+    ).json()
     r = admin_client.post(
-        f"/workspaces/{workspace['id']}/proposals/{proposal['id']}/draft",
+        f"/workspaces/{workspace['id']}/messages",
+        json={
+            "role": "assistant",
+            "content": "invalid proposal",
+            "proposals": [
+                {
+                    "proposal_type": "experiment_draft",
+                    "title": "invalid",
+                    "body": {"k": "v"},
+                }
+            ],
+        },
         headers=headers,
     )
-    assert r.status_code == 400, r.text
+    assert r.status_code == 422, r.text
 
 
 def test_draft_lookup_is_system_scoped(admin_client):

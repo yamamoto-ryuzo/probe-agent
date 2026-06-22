@@ -1454,6 +1454,7 @@ def _probe_plan_out(conn, plan_row, include_run: bool = True) -> ProbePlanOut:
 )
 def generate_probe_plan_endpoint(
     feature_id: str,
+    objective: str = "",
     system_id: int = Depends(get_system_id),
 ) -> ProbePlanOut:
     from ..probe_planner import AcceptedLink, generate_probe_plan
@@ -1553,6 +1554,7 @@ def generate_probe_plan_endpoint(
             feature_success_criteria=json.loads(fd_row["success_criteria"]),
             feature_risks=json.loads(fd_row["risks"]),
             accepted_links=accepted_links,
+            objective_hint=objective,
         )
     except LLMError as exc:
         from ..probe_planner import PlanResult

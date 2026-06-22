@@ -96,6 +96,12 @@ def _seed_traces(system_id, component_id="summarizer", count=3, with_error=True)
 
     now = time.time()
     with get_conn() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO components
+                   (system_id, component_id, mode, updated_at)
+               VALUES (?, ?, 'trace', ?)""",
+            (system_id, component_id, now),
+        )
         for i in range(count):
             conn.execute(
                 """INSERT INTO traces
@@ -212,13 +218,55 @@ def test_pinned_trace_component_yields_trace_digest(admin_client):
     assert digest["representative_input"] is not None
 
 
+def test_trace_digest_redacts_common_secret_fields(admin_client):
+    token, system_id = _setup(admin_client)
+    headers = _headers(token, system_id)
+    _seed_traces(system_id, count=1, with_error=False)
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE traces
+               SET input_json = ?, output_text = ?
+               WHERE system_id = ? AND component_id = ?""",
+            (
+                '{"password":"do-not-send","api_key":"sk-secret"}',
+                "Authorization: Bearer private-token",
+                system_id,
+                "summarizer",
+            ),
+        )
+    workspace = _create_workspace(admin_client, headers)
+    _pin(admin_client, headers, workspace["id"], "trace", "summarizer")
+
+    pack = admin_client.get(
+        f"/workspaces/{workspace['id']}/context-pack", headers=headers
+    ).json()
+    digest = pack["traces"][0]
+    assert "do-not-send" not in digest["representative_input"]
+    assert "sk-secret" not in digest["representative_input"]
+    assert "private-token" not in digest["representative_output"]
+    assert "[REDACTED]" in digest["representative_input"]
+
+
 def test_unknown_pinned_references_are_recorded_as_missing(admin_client):
     token, system_id = _setup(admin_client)
     headers = _headers(token, system_id)
     workspace = _create_workspace(admin_client, headers)
-    _pin(admin_client, headers, workspace["id"], "component", "does-not-exist")
-    _pin(admin_client, headers, workspace["id"], "experiment", "9999")
-    _pin(admin_client, headers, workspace["id"], "probe_plan", "9999")
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        for item_type, item_id in [
+            ("component", "does-not-exist"),
+            ("experiment", "9999"),
+            ("probe_plan", "9999"),
+        ]:
+            conn.execute(
+                """INSERT INTO workspace_context_items
+                       (workspace_id, system_id, item_type, item_id, label, created_at)
+                   VALUES (?, ?, ?, ?, '', ?)""",
+                (workspace["id"], system_id, item_type, item_id, time.time()),
+            )
 
     r = admin_client.get(f"/workspaces/{workspace['id']}/context-pack", headers=headers)
     pack = r.json()

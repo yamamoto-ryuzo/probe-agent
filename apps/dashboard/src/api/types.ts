@@ -454,7 +454,7 @@ export interface SystemProfile {
 // --- Decision Workspace (Issues #35-#37) ------------------------------------
 
 export type WorkspaceContextItemType = "feature" | "component" | "trace" | "experiment" | "probe_plan";
-export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "superseded";
+export type WorkspaceProposalStatus = "proposed" | "accepted" | "rejected" | "deferred" | "superseded";
 
 export interface WorkspaceOut {
   id: number;
@@ -544,4 +544,21 @@ export interface WorkspaceAgentTurnOut {
   assistant_message: WorkspaceMessageOut | null;
   proposals: WorkspaceProposalOut[];
   error: string | null;
+}
+
+export interface WorkspaceProposalDraftOut {
+  id: number;
+  workspace_id: number;
+  proposal_id: number;
+  system_id: number;
+  draft_type: "probe_plan_draft" | "experiment_draft";
+  target_screen: "probe_planner" | "experiments";
+  payload: {
+    feature_id?: string;
+    objective?: string;
+    target_components?: string[];
+    variant_summaries?: string[];
+  };
+  missing_fields: string[];
+  created_at: number;
 }
