@@ -1,22 +1,30 @@
-"""Decision Workspace persistence and CRUD API (Issue #35).
+"""Decision Workspace persistence and CRUD API (Issue #35), plus the
+structured LLM agent-turn endpoint (Issue #37).
 
-This module only stores conversation turns, attached context references,
-structured proposals, and human decisions. It never calls an LLM and never
-changes a proposal's status except through the explicit accept/reject
-endpoints below.
+The CRUD endpoints below only store conversation turns, attached context
+references, structured proposals, and human decisions; they never call an
+LLM and never change a proposal's status except through the explicit
+accept/reject endpoints. The `/agent-turns` endpoint is the one path that
+calls a reasoning-model LLM, and it does so only through `workspace_agent`,
+never directly.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
+from dataclasses import replace
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..auth import Principal, get_principal, get_system_id
 from ..db import get_conn
+from ..llm import LLMConfig, LLMError, create_llm_client
 from ..models import (
+    WorkspaceAgentTurnCreate,
+    WorkspaceAgentTurnOut,
     WorkspaceContextItemCreate,
     WorkspaceContextItemOut,
     WorkspaceContextPack,
@@ -30,6 +38,7 @@ from ..models import (
     WorkspaceProposalOut,
     WorkspaceProposalUpdate,
 )
+from ..workspace_agent import AgentTurnResult, generate_agent_turn
 from ..workspace_context import build_context_pack
 
 router = APIRouter()
@@ -108,6 +117,35 @@ def _get_workspace_or_404(conn, workspace_id: int, system_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
     return row
+
+
+def _pin_context_item(
+    conn,
+    workspace_id: int,
+    system_id: int,
+    item_type: str,
+    item_id: str,
+    label: str,
+    now: float,
+) -> None:
+    """Idempotently attach a context reference to a workspace."""
+    existing = conn.execute(
+        """
+        SELECT id FROM workspace_context_items
+        WHERE workspace_id = ? AND item_type = ? AND item_id = ?
+        """,
+        (workspace_id, item_type, item_id),
+    ).fetchone()
+    if existing is not None:
+        return
+    conn.execute(
+        """
+        INSERT INTO workspace_context_items
+            (workspace_id, system_id, item_type, item_id, label, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (workspace_id, system_id, item_type, item_id, label, now),
+    )
 
 
 def _get_proposal_or_404(conn, workspace_id: int, proposal_id: int, system_id: int):
@@ -199,6 +237,163 @@ def get_workspace_context_pack(
         return build_context_pack(conn, system_id, workspace, context_items)
 
 
+def _resolve_intelligence_llm_config() -> LLMConfig:
+    config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        config = replace(
+            config,
+            provider=intelligence_provider or config.provider,
+            model=intelligence_model or config.model,
+        )
+    return config
+
+
+@router.post(
+    "/workspaces/{workspace_id}/agent-turns",
+    response_model=WorkspaceAgentTurnOut,
+    status_code=201,
+)
+def create_workspace_agent_turn(
+    workspace_id: int,
+    payload: WorkspaceAgentTurnCreate,
+    system_id: int = Depends(get_system_id),
+) -> WorkspaceAgentTurnOut:
+    """Pin requested context, persist the user's message, run the
+    structured Decision Workspace dialogue against the deterministic
+    Context Pack (Issue #36), and persist the assistant turn and any
+    proposals only if the LLM's structured response passes validation
+    (Issue #37). On any failure, only the user's message is persisted --
+    no partial assistant message or proposal is ever stored."""
+    now = time.time()
+    with get_conn() as conn:
+        workspace = _get_workspace_or_404(conn, workspace_id, system_id)
+        for ref in payload.context_refs:
+            _pin_context_item(conn, workspace_id, system_id, ref.type, ref.id, "", now)
+
+        history_rows = conn.execute(
+            "SELECT * FROM workspace_messages WHERE workspace_id = ? ORDER BY id",
+            (workspace_id,),
+        ).fetchall()
+        history = [{"role": row["role"], "content": row["content"]} for row in history_rows]
+
+        cur = conn.execute(
+            """
+            INSERT INTO workspace_messages
+                (workspace_id, system_id, role, content, context_metadata, created_at)
+            VALUES (?, ?, 'user', ?, '{}', ?)
+            """,
+            (workspace_id, system_id, payload.message, now),
+        )
+        user_message_row = conn.execute(
+            "SELECT * FROM workspace_messages WHERE id = ?", (cur.lastrowid,)
+        ).fetchone()
+        user_message_out = _message_out(user_message_row)
+
+        context_items = conn.execute(
+            "SELECT * FROM workspace_context_items WHERE workspace_id = ? ORDER BY id",
+            (workspace_id,),
+        ).fetchall()
+        context_pack = build_context_pack(conn, system_id, workspace, context_items)
+        workspace_summary = workspace["summary"] or ""
+
+    config = _resolve_intelligence_llm_config()
+    try:
+        client = create_llm_client(config)
+    except LLMError as exc:
+        result = AgentTurnResult(provider=config.provider, model=config.model, is_mock=False, error=str(exc))
+    else:
+        result = generate_agent_turn(
+            client,
+            config,
+            context_pack=context_pack,
+            workspace_summary=workspace_summary,
+            history=history,
+            user_message=payload.message,
+        )
+
+    if result.error:
+        return WorkspaceAgentTurnOut(
+            user_message=user_message_out,
+            assistant_message=None,
+            proposals=[],
+            error=result.error,
+        )
+
+    now = time.time()
+    with get_conn() as conn:
+        assistant_metadata = {
+            "grounded_findings": [
+                {
+                    "claim": f.claim,
+                    "source_type": f.source_type,
+                    "source_id": f.source_id,
+                }
+                for f in result.grounded_findings
+            ],
+            "assumptions": result.assumptions,
+            "missing_information": result.missing_information,
+            "next_questions": result.next_questions,
+            "provider": result.provider,
+            "model": result.model,
+        }
+        cur = conn.execute(
+            """
+            INSERT INTO workspace_messages
+                (workspace_id, system_id, role, content, context_metadata, created_at)
+            VALUES (?, ?, 'assistant', ?, ?, ?)
+            """,
+            (
+                workspace_id,
+                system_id,
+                result.assistant_message,
+                json.dumps(assistant_metadata, ensure_ascii=False),
+                now,
+            ),
+        )
+        assistant_message_id = cur.lastrowid
+        proposal_outs: List[WorkspaceProposalOut] = []
+        for proposal in result.proposals:
+            cur = conn.execute(
+                """
+                INSERT INTO workspace_proposals
+                    (workspace_id, system_id, message_id, proposal_type, title,
+                     body, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                """,
+                (
+                    workspace_id,
+                    system_id,
+                    assistant_message_id,
+                    proposal.proposal_type,
+                    proposal.title,
+                    json.dumps(proposal.body, ensure_ascii=False),
+                    now,
+                    now,
+                ),
+            )
+            proposal_row = conn.execute(
+                "SELECT * FROM workspace_proposals WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+            proposal_outs.append(_proposal_out(conn, proposal_row))
+
+        assistant_message_row = conn.execute(
+            "SELECT * FROM workspace_messages WHERE id = ?", (assistant_message_id,)
+        ).fetchone()
+        conn.execute(
+            "UPDATE workspaces SET updated_at = ? WHERE id = ?",
+            (now, workspace_id),
+        )
+
+    return WorkspaceAgentTurnOut(
+        user_message=user_message_out,
+        assistant_message=_message_out(assistant_message_row),
+        proposals=proposal_outs,
+        error=None,
+    )
+
+
 @router.post(
     "/workspaces/{workspace_id}/messages",
     response_model=WorkspaceMessageOut,
@@ -270,32 +465,16 @@ def add_workspace_context_item(
     now = time.time()
     with get_conn() as conn:
         _get_workspace_or_404(conn, workspace_id, system_id)
-        existing = conn.execute(
+        _pin_context_item(
+            conn, workspace_id, system_id, payload.item_type, payload.item_id,
+            payload.label, now,
+        )
+        row = conn.execute(
             """
             SELECT * FROM workspace_context_items
             WHERE workspace_id = ? AND item_type = ? AND item_id = ?
             """,
             (workspace_id, payload.item_type, payload.item_id),
-        ).fetchone()
-        if existing is not None:
-            return _context_item_out(existing)
-        cur = conn.execute(
-            """
-            INSERT INTO workspace_context_items
-                (workspace_id, system_id, item_type, item_id, label, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                workspace_id,
-                system_id,
-                payload.item_type,
-                payload.item_id,
-                payload.label,
-                now,
-            ),
-        )
-        row = conn.execute(
-            "SELECT * FROM workspace_context_items WHERE id = ?", (cur.lastrowid,)
         ).fetchone()
         return _context_item_out(row)
 

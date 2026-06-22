@@ -1028,3 +1028,27 @@ class WorkspaceContextPack(BaseModel):
     human_decisions: List[WorkspaceHumanDecisionDigest] = Field(default_factory=list)
     evidence: List[WorkspaceEvidenceRef] = Field(default_factory=list)
     missing_information: List[str] = Field(default_factory=list)
+
+
+# --- Decision Workspace structured agent turn (Issue #37) ------------------
+
+
+class WorkspaceContextRef(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: WorkspaceContextItemType
+    id: str = Field(..., min_length=1, max_length=200)
+
+
+class WorkspaceAgentTurnCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(..., min_length=1, max_length=20_000)
+    context_refs: List[WorkspaceContextRef] = Field(default_factory=list, max_length=20)
+
+
+class WorkspaceAgentTurnOut(BaseModel):
+    user_message: WorkspaceMessageOut
+    assistant_message: Optional[WorkspaceMessageOut] = None
+    proposals: List[WorkspaceProposalOut] = Field(default_factory=list)
+    error: Optional[str] = None
