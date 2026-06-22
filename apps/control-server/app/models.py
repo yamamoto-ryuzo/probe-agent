@@ -203,6 +203,7 @@ class RepositorySnapshot(BaseModel):
 
 
 SourceType = Literal["documentation", "source", "test", "configuration"]
+InclusionStatus = Literal["indexed", "metadata_only", "too_large", "binary"]
 SnapshotStatus = Literal["not_configured", "indexing", "ready", "failed"]
 IntelligenceRunStatus = Literal["pending", "completed", "failed"]
 IntelligenceRunType = Literal[
@@ -240,6 +241,8 @@ class SnapshotFileOut(BaseModel):
     path: str
     source_type: SourceType
     size_bytes: int
+    inclusion_status: InclusionStatus = "indexed"
+    exclusion_reason: str = ""
 
 
 class SnapshotOut(BaseModel):
@@ -250,6 +253,9 @@ class SnapshotOut(BaseModel):
     status: SnapshotStatus
     file_count: int
     total_size: int
+    indexed_size: int = 0
+    metadata_only_count: int = 0
+    warnings: List[str] = Field(default_factory=list)
     error_summary: Optional[str] = None
     created_at: float
     completed_at: Optional[float] = None

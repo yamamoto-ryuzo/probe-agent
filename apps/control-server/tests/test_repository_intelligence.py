@@ -378,14 +378,15 @@ class TestSnapshots:
         assert r.json()["status"] == "failed"
         assert "Git directory is outside" in r.json()["error_summary"]
 
-    def test_snapshot_reports_oversized_included_file(
+    def test_snapshot_records_oversized_file_as_too_large(
         self, admin_client, git_repo, monkeypatch
     ):
         import app.git_ops as git_ops
 
         (git_repo / "large.txt").write_text("x" * 128)
+        (git_repo / "small.txt").write_text("small file")
         subprocess.run(
-            ["git", "-C", str(git_repo), "add", "large.txt"],
+            ["git", "-C", str(git_repo), "add", "."],
             check=True,
             capture_output=True,
         )
@@ -401,12 +402,22 @@ class TestSnapshots:
         h = _headers(token, system["id"])
         admin_client.put(
             "/repository",
-            json={"repo_path": str(git_repo), "include_patterns": ["large.txt"]},
+            json={
+                "repo_path": str(git_repo),
+                "include_patterns": ["large.txt", "small.txt"],
+            },
             headers=h,
         )
         r = admin_client.post("/repository/snapshots", headers=h)
-        assert r.json()["status"] == "failed"
-        assert "MAX_FILE_SIZE" in r.json()["error_summary"]
+        body = r.json()
+        assert body["status"] == "ready"
+        assert body["metadata_only_count"] == 1
+        assert len(body["warnings"]) > 0
+
+        file_map = {f["path"]: f for f in body["files"]}
+        assert file_map["large.txt"]["inclusion_status"] == "too_large"
+        assert "SNAPSHOT_MAX_FILE_SIZE" in file_map["large.txt"]["exclusion_reason"]
+        assert file_map["small.txt"]["inclusion_status"] == "indexed"
 
     def test_snapshot_skips_committed_symlinks(
         self, admin_client, git_repo, tmp_path
@@ -504,6 +515,189 @@ class TestSnapshots:
 # ---------------------------------------------------------------------------
 # Draft generation tests
 # ---------------------------------------------------------------------------
+
+
+class TestSnapshotSizeLimits:
+    """Tests for Issue #34: Snapshot storage limits separated from LLM context."""
+
+    def test_large_repo_exceeding_old_limit_creates_snapshot(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        """Repos exceeding the old 5 MiB MAX_TOTAL_SIZE must still snapshot."""
+        import app.git_ops as git_ops
+
+        monkeypatch.setattr(git_ops, "MAX_FILE_SIZE", 1024 * 1024)
+        for i in range(10):
+            (git_repo / f"file_{i}.py").write_text(f"content = 'data-{i}' * 100\n")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "."],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "many files"],
+            check=True, capture_output=True,
+        )
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "LargeRepo")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": []},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        body = r.json()
+        assert body["status"] == "ready"
+        assert body["file_count"] > 0
+
+    def test_binary_file_recorded_without_content(
+        self, admin_client, git_repo
+    ):
+        (git_repo / "image.bin").write_bytes(b"\x89PNG\x00\x00\x01\x02")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "."],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "binary"],
+            check=True, capture_output=True,
+        )
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "BinaryFile")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": []},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        body = r.json()
+        assert body["status"] == "ready"
+
+        file_map = {f["path"]: f for f in body["files"]}
+        assert file_map["image.bin"]["inclusion_status"] == "binary"
+        assert "binary" in file_map["image.bin"]["exclusion_reason"].lower()
+        assert body["metadata_only_count"] >= 1
+
+    def test_indexed_size_tracks_content_stored_files_only(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        import app.git_ops as git_ops
+
+        (git_repo / "big.txt").write_text("x" * 200)
+        (git_repo / "ok.txt").write_text("small")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "."],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "mixed"],
+            check=True, capture_output=True,
+        )
+        monkeypatch.setattr(git_ops, "MAX_FILE_SIZE", 100)
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "IndexedSize")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={
+                "repo_path": str(git_repo),
+                "include_patterns": ["big.txt", "ok.txt"],
+            },
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        body = r.json()
+        assert body["status"] == "ready"
+        assert body["indexed_size"] < body["total_size"]
+        assert body["indexed_size"] == 5  # len("small")
+
+    def test_draft_generation_skips_non_indexed_files(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        """Draft generation must only use files with inclusion_status='indexed'."""
+        import app.git_ops as git_ops
+
+        (git_repo / "huge_doc.md").write_text("# Doc\n" + "x" * 200)
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "."],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "large doc"],
+            check=True, capture_output=True,
+        )
+        monkeypatch.setattr(git_ops, "MAX_FILE_SIZE", 50)
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "SkipNonIndexed")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={
+                "repo_path": str(git_repo),
+                "include_patterns": ["README.md", "src/**", "huge_doc.md"],
+            },
+            headers=h,
+        )
+        admin_client.post("/repository/snapshots", headers=h)
+        r = admin_client.post("/repository/drafts/generate", headers=h)
+        assert r.status_code == 201
+        assert r.json()["intelligence_run"]["status"] == "completed"
+
+    def test_snapshot_warnings_populated(
+        self, admin_client, git_repo, monkeypatch
+    ):
+        import app.git_ops as git_ops
+
+        (git_repo / "big.txt").write_text("x" * 200)
+        (git_repo / "data.bin").write_bytes(b"\x00\x01\x02")
+        subprocess.run(
+            ["git", "-C", str(git_repo), "add", "."],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(git_repo), "commit", "-m", "mixed"],
+            check=True, capture_output=True,
+        )
+        monkeypatch.setattr(git_ops, "MAX_FILE_SIZE", 100)
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "Warnings")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(git_repo), "include_patterns": []},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        body = r.json()
+        assert body["status"] == "ready"
+        assert len(body["warnings"]) >= 2
+        warning_text = " ".join(body["warnings"])
+        assert "size limit" in warning_text.lower() or "exceeded" in warning_text.lower()
+        assert "binary" in warning_text.lower()
+
+    def test_snapshot_status_failed_not_shown_as_success(
+        self, admin_client, tmp_path
+    ):
+        """HTTP 201 with status='failed' must not be treated as success."""
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "FailedNotSuccess")
+        h = _headers(token, system["id"])
+        admin_client.put(
+            "/repository",
+            json={"repo_path": str(tmp_path / "nonexistent")},
+            headers=h,
+        )
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.status_code == 201
+        body = r.json()
+        assert body["status"] == "failed"
+        assert body["error_summary"] is not None
 
 
 class TestDraftGeneration:
@@ -911,3 +1105,60 @@ class TestRepositorySchemaMigration:
                 for row in migrated.execute("PRAGMA table_info(snapshot_files)")
             }
         assert "content" in columns
+        assert "inclusion_status" in columns
+        assert "exclusion_reason" in columns
+
+    def test_adds_snapshot_indexed_size_column(self, tmp_path, monkeypatch):
+        db_file = tmp_path / "old-snapshot-schema.db"
+        conn = sqlite3.connect(db_file)
+        conn.execute(
+            """
+            CREATE TABLE repository_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                system_id INTEGER NOT NULL,
+                repo_path TEXT NOT NULL DEFAULT '',
+                commit_sha TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'indexing',
+                file_count INTEGER NOT NULL DEFAULT 0,
+                total_size INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT,
+                created_at REAL NOT NULL,
+                completed_at REAL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE snapshot_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT,
+                content BLOB NOT NULL DEFAULT X''
+            )
+            """
+        )
+        conn.close()
+
+        monkeypatch.setenv("PROBE_DB_PATH", str(db_file))
+        from app.db import get_conn, init_db
+
+        init_db()
+        with get_conn() as migrated:
+            snap_columns = {
+                row["name"]
+                for row in migrated.execute(
+                    "PRAGMA table_info(repository_snapshots)"
+                )
+            }
+            file_columns = {
+                row["name"]
+                for row in migrated.execute("PRAGMA table_info(snapshot_files)")
+            }
+        assert "indexed_size" in snap_columns
+        assert "metadata_only_count" in snap_columns
+        assert "warnings" in snap_columns
+        assert "inclusion_status" in file_columns
+        assert "exclusion_reason" in file_columns

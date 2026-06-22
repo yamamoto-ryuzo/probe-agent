@@ -13,8 +13,8 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { toast } from "sonner";
-import { formatTimestamp } from "@/lib/utils";
-import { GitCommit, FolderTree, Code2, RefreshCw } from "lucide-react";
+import { formatTimestamp, formatBytes } from "@/lib/utils";
+import { GitCommit, FolderTree, Code2, RefreshCw, AlertTriangle } from "lucide-react";
 import type { RepositoryCandidateOut, RepositoryConfigOut } from "@/api/types";
 
 function patternsToText(patterns: string[] | undefined): string {
@@ -97,20 +97,45 @@ export default function RepositoryPage() {
               ) : (
                 <div className="space-y-3">
                   {snapshots.map(s => (
-                    <div key={s.id} className="flex items-start justify-between rounded-lg border p-4">
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
-                          <GitCommit className="h-4 w-4 text-muted-foreground" />
-                          <span className="font-mono text-xs">{s.commit_sha?.slice(0, 8)}</span>
-                          <Badge variant={s.status === "ready" ? "success" : s.status === "failed" ? "destructive" : "secondary"}>
-                            {s.status}
-                          </Badge>
-                        </div>
-                        <div className="flex items-center gap-4 text-xs text-muted-foreground">
-                          <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count} files</span>
-                          <span>{formatTimestamp(s.created_at)}</span>
+                    <div key={s.id} className="rounded-lg border p-4 space-y-2">
+                      <div className="flex items-start justify-between">
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-2">
+                            <GitCommit className="h-4 w-4 text-muted-foreground" />
+                            <span className="font-mono text-xs">{s.commit_sha?.slice(0, 8)}</span>
+                            <Badge variant={s.status === "ready" ? "success" : s.status === "failed" ? "destructive" : "secondary"}>
+                              {s.status}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center gap-4 text-xs text-muted-foreground">
+                            <span><FolderTree className="inline h-3 w-3 mr-1" />{s.file_count} files</span>
+                            <span>{formatBytes(s.total_size)} total</span>
+                            {s.indexed_size > 0 && s.indexed_size !== s.total_size && (
+                              <span>{formatBytes(s.indexed_size)} indexed</span>
+                            )}
+                            {s.metadata_only_count > 0 && (
+                              <span className="text-yellow-600">{s.metadata_only_count} metadata-only</span>
+                            )}
+                            <span>{formatTimestamp(s.created_at)}</span>
+                          </div>
                         </div>
                       </div>
+                      {s.status === "failed" && s.error_summary && (
+                        <div className="flex items-start gap-2 text-xs text-destructive bg-destructive/10 rounded p-2">
+                          <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                          <span>{s.error_summary}</span>
+                        </div>
+                      )}
+                      {s.warnings?.length > 0 && (
+                        <div className="space-y-1">
+                          {s.warnings.map((w, i) => (
+                            <div key={i} className="flex items-start gap-2 text-xs text-yellow-700 bg-yellow-50 dark:bg-yellow-900/20 dark:text-yellow-400 rounded p-2">
+                              <AlertTriangle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                              <span>{w}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

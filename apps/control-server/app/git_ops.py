@@ -3,6 +3,13 @@
 All reads use `git show <sha>:<path>` and `git ls-tree <sha>` so that untracked,
 ignored, and uncommitted content is never included.  Path traversal and
 symlink escapes are rejected before any read.
+
+Snapshot storage limits and LLM context limits are separate concerns:
+- ``MAX_FILE_SIZE`` controls the per-file content storage threshold for
+  snapshots.  Files exceeding this are recorded as ``too_large`` with
+  metadata only (no content).  Configurable via ``SNAPSHOT_MAX_FILE_SIZE``.
+- LLM context budgets are managed independently by each consumer
+  (e.g. ``draft_generator._build_file_context``).
 """
 
 from __future__ import annotations
@@ -15,8 +22,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-MAX_FILE_SIZE = 512 * 1024  # 512 KiB per file
-MAX_TOTAL_SIZE = 5 * 1024 * 1024  # 5 MiB total payload to LLM
+MAX_FILE_SIZE = int(os.getenv("SNAPSHOT_MAX_FILE_SIZE", str(512 * 1024)))
 
 DEFAULT_EXCLUDE = [
     ".env",
@@ -36,12 +42,17 @@ class GitError(Exception):
     pass
 
 
+INCLUSION_STATUSES = {"indexed", "metadata_only", "too_large", "binary"}
+
+
 @dataclass
 class IndexedFile:
     path: str
     source_type: str  # documentation | source | test | configuration
     size_bytes: int
     content_hash: str
+    inclusion_status: str = "indexed"  # indexed | metadata_only | too_large | binary
+    exclusion_reason: str = ""
     content: bytes = field(repr=False, default=b"")
 
 
@@ -271,7 +282,6 @@ def create_snapshot(
     all_exclude = list(exclude_patterns) + DEFAULT_EXCLUDE
 
     files: List[IndexedFile] = []
-    total_size = 0
 
     for entry in sorted(entries, key=lambda item: item.path):
         path = entry.path
@@ -286,27 +296,45 @@ def create_snapshot(
             continue
 
         size = _object_size(real_path, entry.object_id)
+        source_type = classify_source_type(path)
+
         if size > MAX_FILE_SIZE:
-            raise GitError(
-                f"Included file exceeds MAX_FILE_SIZE ({MAX_FILE_SIZE} bytes): {path}"
-            )
-        if total_size + size > MAX_TOTAL_SIZE:
-            raise GitError(
-                f"Snapshot exceeds MAX_TOTAL_SIZE ({MAX_TOTAL_SIZE} bytes) at: {path}"
-            )
+            files.append(IndexedFile(
+                path=path,
+                source_type=source_type,
+                size_bytes=size,
+                content_hash=entry.object_id,
+                inclusion_status="too_large",
+                exclusion_reason=(
+                    f"File size ({size} bytes) exceeds "
+                    f"SNAPSHOT_MAX_FILE_SIZE ({MAX_FILE_SIZE} bytes)"
+                ),
+            ))
+            continue
+
         content = read_file_at_commit(real_path, commit_sha, path)
         if len(content) != size:
             raise GitError(f"Git object size changed while reading: {path}")
-        total_size += size
 
         content_hash = hashlib.sha256(content).hexdigest()
-        source_type = classify_source_type(path)
+
+        if b"\x00" in content:
+            files.append(IndexedFile(
+                path=path,
+                source_type=source_type,
+                size_bytes=size,
+                content_hash=content_hash,
+                inclusion_status="binary",
+                exclusion_reason="File contains null bytes (binary content)",
+            ))
+            continue
 
         files.append(IndexedFile(
             path=path,
             source_type=source_type,
             size_bytes=size,
             content_hash=content_hash,
+            inclusion_status="indexed",
             content=content,
         ))
 

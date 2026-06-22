@@ -219,7 +219,8 @@ def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOu
     files = []
     if include_files:
         file_rows = conn.execute(
-            "SELECT path, source_type, size_bytes FROM snapshot_files WHERE snapshot_id = ?",
+            "SELECT path, source_type, size_bytes, inclusion_status, exclusion_reason "
+            "FROM snapshot_files WHERE snapshot_id = ?",
             (snapshot_row["id"],),
         ).fetchall()
         files = [
@@ -227,6 +228,8 @@ def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOu
                 path=fr["path"],
                 source_type=fr["source_type"],
                 size_bytes=fr["size_bytes"],
+                inclusion_status=fr["inclusion_status"],
+                exclusion_reason=fr["exclusion_reason"],
             )
             for fr in file_rows
         ]
@@ -238,6 +241,9 @@ def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOu
         status=snapshot_row["status"],
         file_count=snapshot_row["file_count"],
         total_size=snapshot_row["total_size"],
+        indexed_size=snapshot_row["indexed_size"],
+        metadata_only_count=snapshot_row["metadata_only_count"],
+        warnings=json.loads(snapshot_row["warnings"] or "[]"),
         error_summary=snapshot_row["error_summary"],
         created_at=snapshot_row["created_at"],
         completed_at=snapshot_row["completed_at"],
@@ -295,6 +301,24 @@ def create_snapshot_endpoint(
         return _snapshot_out(conn, row)
 
     total_size = sum(f.size_bytes for f in files)
+    indexed_size = sum(
+        f.size_bytes for f in files if f.inclusion_status == "indexed"
+    )
+    metadata_only_count = sum(
+        1 for f in files if f.inclusion_status != "indexed"
+    )
+    warnings = []
+    too_large_files = [f for f in files if f.inclusion_status == "too_large"]
+    binary_files = [f for f in files if f.inclusion_status == "binary"]
+    if too_large_files:
+        warnings.append(
+            f"{len(too_large_files)} file(s) exceeded the per-file size limit "
+            f"and were recorded without content"
+        )
+    if binary_files:
+        warnings.append(
+            f"{len(binary_files)} binary file(s) were recorded without content"
+        )
     completed_at = time.time()
 
     with get_conn() as conn:
@@ -304,17 +328,25 @@ def create_snapshot_endpoint(
                 """
                 UPDATE repository_snapshots
                 SET commit_sha = ?, status = 'ready', file_count = ?,
-                    total_size = ?, completed_at = ?
+                    total_size = ?, indexed_size = ?,
+                    metadata_only_count = ?, warnings = ?,
+                    completed_at = ?
                 WHERE id = ?
                 """,
-                (commit_sha, len(files), total_size, completed_at, snapshot_id),
+                (
+                    commit_sha, len(files), total_size,
+                    indexed_size, metadata_only_count,
+                    json.dumps(warnings), completed_at, snapshot_id,
+                ),
             )
             for f in files:
                 conn.execute(
                     """
                     INSERT INTO snapshot_files
-                        (snapshot_id, path, source_type, size_bytes, content_hash, content)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                        (snapshot_id, path, source_type, size_bytes,
+                         content_hash, content, inclusion_status,
+                         exclusion_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         snapshot_id,
@@ -323,6 +355,8 @@ def create_snapshot_endpoint(
                         f.size_bytes,
                         f.content_hash,
                         f.content,
+                        f.inclusion_status,
+                        f.exclusion_reason,
                     ),
                 )
             conn.execute("COMMIT")
@@ -478,7 +512,7 @@ def generate_drafts_endpoint(
             """
             SELECT path, source_type, size_bytes, content_hash, content
             FROM snapshot_files
-            WHERE snapshot_id = ?
+            WHERE snapshot_id = ? AND inclusion_status = 'indexed'
             ORDER BY path
             """,
             (snapshot_id,),
@@ -853,7 +887,7 @@ def index_symbols_endpoint(
         file_rows = conn.execute(
             """
             SELECT path, content FROM snapshot_files
-            WHERE snapshot_id = ?
+            WHERE snapshot_id = ? AND inclusion_status = 'indexed'
             ORDER BY path
             """,
             (snapshot_id,),

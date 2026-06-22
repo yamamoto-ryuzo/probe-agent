@@ -22,3 +22,11 @@ export function formatTimestamp(ts: number | string | null | undefined): string 
 export function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "…" : s;
 }
+
+export function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  const i = Math.min(Math.floor(Math.log2(bytes) / 10), units.length - 1);
+  const value = bytes / (1 << (i * 10));
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
+}
