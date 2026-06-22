@@ -33,7 +33,9 @@
       "properties": {
         "path": { "type": "string" },
         "source_type": { "enum": ["documentation", "source", "test", "configuration"] },
-        "size_bytes": { "type": "integer", "minimum": 0 }
+        "size_bytes": { "type": "integer", "minimum": 0 },
+        "inclusion_status": { "enum": ["indexed", "metadata_only", "too_large", "binary"], "default": "indexed" },
+        "exclusion_reason": { "type": "string", "default": "" }
       },
       "additionalProperties": false
     },
@@ -48,6 +50,9 @@
         "status": { "enum": ["not_configured", "indexing", "ready", "failed"] },
         "file_count": { "type": "integer", "minimum": 0 },
         "total_size": { "type": "integer", "minimum": 0 },
+        "indexed_size": { "type": "integer", "minimum": 0, "default": 0 },
+        "metadata_only_count": { "type": "integer", "minimum": 0, "default": 0 },
+        "warnings": { "type": "array", "items": { "type": "string" }, "default": [] },
         "error_summary": { "type": ["string", "null"] },
         "created_at": { "type": "number" },
         "completed_at": { "type": ["number", "null"] },

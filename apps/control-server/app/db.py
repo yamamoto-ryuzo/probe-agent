@@ -219,16 +219,19 @@ CREATE TABLE IF NOT EXISTS repository_configs (
 );
 
 CREATE TABLE IF NOT EXISTS repository_snapshots (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    system_id       INTEGER NOT NULL,
-    repo_path       TEXT NOT NULL DEFAULT '',
-    commit_sha      TEXT NOT NULL,
-    status          TEXT NOT NULL DEFAULT 'indexing',
-    file_count      INTEGER NOT NULL DEFAULT 0,
-    total_size      INTEGER NOT NULL DEFAULT 0,
-    error_summary   TEXT,
-    created_at      REAL NOT NULL,
-    completed_at    REAL,
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    repo_path           TEXT NOT NULL DEFAULT '',
+    commit_sha          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'indexing',
+    file_count          INTEGER NOT NULL DEFAULT 0,
+    total_size          INTEGER NOT NULL DEFAULT 0,
+    indexed_size        INTEGER NOT NULL DEFAULT 0,
+    metadata_only_count INTEGER NOT NULL DEFAULT 0,
+    warnings            TEXT NOT NULL DEFAULT '[]',
+    error_summary       TEXT,
+    created_at          REAL NOT NULL,
+    completed_at        REAL,
     FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
 );
 
@@ -236,13 +239,15 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_system
     ON repository_snapshots (system_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS snapshot_files (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    snapshot_id     INTEGER NOT NULL,
-    path            TEXT NOT NULL,
-    source_type     TEXT NOT NULL,
-    size_bytes      INTEGER NOT NULL DEFAULT 0,
-    content_hash    TEXT,
-    content         BLOB NOT NULL DEFAULT X'',
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id      INTEGER NOT NULL,
+    path             TEXT NOT NULL,
+    source_type      TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL DEFAULT 0,
+    content_hash     TEXT,
+    content          BLOB NOT NULL DEFAULT X'',
+    inclusion_status TEXT NOT NULL DEFAULT 'indexed',
+    exclusion_reason TEXT NOT NULL DEFAULT '',
     FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
 );
 
@@ -769,6 +774,33 @@ def init_db() -> None:
         if "content" not in _columns(conn, "snapshot_files"):
             conn.execute(
                 "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"
+            )
+        sf_cols = _columns(conn, "snapshot_files")
+        if "inclusion_status" not in sf_cols:
+            conn.execute(
+                "ALTER TABLE snapshot_files "
+                "ADD COLUMN inclusion_status TEXT NOT NULL DEFAULT 'indexed'"
+            )
+        if "exclusion_reason" not in sf_cols:
+            conn.execute(
+                "ALTER TABLE snapshot_files "
+                "ADD COLUMN exclusion_reason TEXT NOT NULL DEFAULT ''"
+            )
+        snap_cols = _columns(conn, "repository_snapshots")
+        if "indexed_size" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN indexed_size INTEGER NOT NULL DEFAULT 0"
+            )
+        if "metadata_only_count" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN metadata_only_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "warnings" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'"
             )
         if "repo_path" not in _columns(conn, "repository_snapshots"):
             conn.execute(

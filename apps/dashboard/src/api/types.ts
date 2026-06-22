@@ -101,6 +101,8 @@ export interface SnapshotFileOut {
   path: string;
   source_type: string;
   size_bytes: number;
+  inclusion_status: "indexed" | "metadata_only" | "too_large" | "binary";
+  exclusion_reason: string;
 }
 
 export interface SnapshotOut {
@@ -111,6 +113,9 @@ export interface SnapshotOut {
   status: string;
   file_count: number;
   total_size: number;
+  indexed_size: number;
+  metadata_only_count: number;
+  warnings: string[];
   error_summary: string | null;
   created_at: string;
   completed_at: string | null;
