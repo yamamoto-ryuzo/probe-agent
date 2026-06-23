@@ -287,6 +287,116 @@ export interface ProbePlansListOut {
   is_mock: boolean;
 }
 
+// ── Flow graph explorer (Issue #43) ─────────────────────────────────
+
+export interface EvidenceRefOut {
+  path: string;
+  start_line: number;
+  end_line: number;
+  summary: string;
+}
+
+export interface ProbePreviewOut {
+  recommended_mode: string;
+  captured_data: string[];
+  redaction: string[];
+  replayability: string;
+  estimated_event_volume: string;
+  side_effect_risk: "low" | "medium" | "high";
+  denylist_hit: string | null;
+}
+
+export interface FlowEntrypointOut {
+  entrypoint_type: "http_route" | "public_function";
+  entrypoint_id: string;
+  label: string;
+  path: string;
+  qualified_name: string;
+  line_start: number;
+  line_end: number;
+  component_id: string | null;
+  route_method: string | null;
+  route_path: string | null;
+}
+
+export interface FlowEntrypointsOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  entrypoints: FlowEntrypointOut[];
+}
+
+export interface FlowNodeOut {
+  node_id: string;
+  node_type: string;
+  symbol_id: number | null;
+  qualified_name: string;
+  path: string;
+  line_start: number;
+  line_end: number;
+  component_id: string | null;
+  probe_capabilities: string[];
+  risk: "low" | "medium" | "high";
+  denylist_hit: string | null;
+  evidence: EvidenceRefOut[];
+  boundary_kind: string | null;
+  is_external: boolean;
+  trace_count: number;
+  error_count: number;
+  evaluation_pass: number;
+  evaluation_fail: number;
+  observed: boolean;
+  preview: ProbePreviewOut | null;
+}
+
+export interface FlowEdgeOut {
+  edge_id: string;
+  source_node_id: string;
+  target_node_id: string | null;
+  edge_type: string;
+  confidence: number;
+  resolution: "resolved" | "inferred" | "unresolved";
+  callee_name: string;
+  line: number;
+  evidence: EvidenceRefOut[];
+  preview: ProbePreviewOut | null;
+}
+
+export interface CandidateFlowOut {
+  flow_id: string;
+  title: string;
+  summary: string;
+  entrypoint_node_id: string;
+  node_ids: string[];
+  node_count: number;
+  max_depth: number;
+  confidence: number;
+  unresolved_edge_count: number;
+  external_boundary_count: number;
+  observed_node_count: number;
+  unobserved_node_ids: string[];
+}
+
+export interface FlowGraphOut {
+  system_id: number;
+  snapshot_id: number;
+  commit_sha: string;
+  entrypoint: FlowEntrypointOut;
+  nodes: FlowNodeOut[];
+  edges: FlowEdgeOut[];
+  candidate_paths: CandidateFlowOut[];
+  diagnostics: string[];
+  truncated: boolean;
+}
+
+export interface FlowProbeSelection {
+  target_type: "node" | "edge";
+  node_id?: string;
+  edge_id?: string;
+  observation: "input" | "output" | "boundary";
+  mode_preference: "trace" | "shadow" | "off";
+}
+
 export interface ValidationCommandOut {
   id: number;
   command: string;

@@ -13,12 +13,23 @@ const mockApi = {
 };
 let mockSystemId: number | null = 1;
 
+class ApiError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 vi.mock("@/api/client", () => ({
   api: mockApi,
   getSystemId: () => mockSystemId,
   setSystemId: (id: number | null) => { mockSystemId = id; },
   getSessionToken: () => "fake-token",
   setSessionToken: vi.fn(),
+  ApiError,
 }));
 
 vi.mock("@/api/auth", () => ({
@@ -407,6 +418,263 @@ describe("Probe Patch application", () => {
         },
       );
     });
+  });
+});
+
+// ── Flow Explorer tests ─────────────────────────────────────────────
+
+describe("Flow Explorer page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const flowGraph = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abcdef1234567890",
+    entrypoint: {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+      line_start: 5, line_end: 11, component_id: null, route_method: "POST", route_path: "/documents/analyze",
+    },
+    nodes: [
+      {
+        node_id: "app.py::analyze_document", node_type: "http_route", symbol_id: 1,
+        qualified_name: "analyze_document", path: "app.py", line_start: 5, line_end: 11,
+        component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
+        risk: "low", denylist_hit: null, evidence: [],
+        boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
+        evaluation_pass: 0, evaluation_fail: 0, observed: false,
+        preview: {
+          recommended_mode: "trace", captured_data: ["return value"], redaction: ["truncated"],
+          replayability: "safe", estimated_event_volume: "unknown", side_effect_risk: "low",
+          denylist_hit: null,
+        },
+      },
+      {
+        node_id: "app.py::parse_blocks", node_type: "function", symbol_id: 2,
+        qualified_name: "parse_blocks", path: "app.py", line_start: 14, line_end: 15,
+        component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
+        risk: "low", denylist_hit: null, evidence: [],
+        boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
+        evaluation_pass: 0, evaluation_fail: 0, observed: false,
+        preview: {
+          recommended_mode: "trace", captured_data: ["return value"], redaction: ["truncated"],
+          replayability: "safe", estimated_event_volume: "unknown", side_effect_risk: "low",
+          denylist_hit: null,
+        },
+      },
+    ],
+    edges: [
+      {
+        edge_id: "edge::app.py::analyze_document::app.py::parse_blocks::call::7",
+        source_node_id: "app.py::analyze_document", target_node_id: "app.py::parse_blocks",
+        edge_type: "call", confidence: 1.0, resolution: "resolved", callee_name: "parse_blocks",
+        line: 7, evidence: [],
+        preview: {
+          recommended_mode: "trace", captured_data: ["arguments before parse_blocks()"],
+          redaction: ["truncated"], replayability: "caution", estimated_event_volume: "unknown",
+          side_effect_risk: "low", denylist_hit: null,
+        },
+      },
+    ],
+    candidate_paths: [
+      {
+        flow_id: "flow-1", title: "analyze_document → parse_blocks", summary: "",
+        entrypoint_node_id: "app.py::analyze_document",
+        node_ids: ["app.py::analyze_document", "app.py::parse_blocks"],
+        node_count: 2, max_depth: 1, confidence: 1.0, unresolved_edge_count: 0,
+        external_boundary_count: 0, observed_node_count: 0, unobserved_node_ids: [],
+      },
+    ],
+    diagnostics: [],
+    truncated: false,
+  };
+
+  test("builds graph and creates a manual plan from selected nodes", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.resolve({ id: 42, status: "proposed", probe_points: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    // Open the entrypoint -> builds the graph.
+    const entrypointBtn = await screen.findByText("/documents/analyze");
+    fireEvent.click(entrypointBtn);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", {
+        entrypoint_type: "http_route",
+        entrypoint_id: "POST:/documents/analyze",
+      });
+    });
+
+    // Select the parse_blocks node from the graph (the node label, not the
+    // edge target label which shares the same text).
+    const matches = await screen.findAllByText("parse_blocks");
+    const nodeLabel = matches.find(el => el.className.includes("font-medium"));
+    fireEvent.click(nodeLabel!);
+
+    const createBtn = await screen.findByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.objectContaining({
+          entrypoint_type: "http_route",
+          entrypoint_id: "POST:/documents/analyze",
+          snapshot_id: 5,
+          commit_sha: "abcdef1234567890",
+          selections: [
+            {
+              target_type: "node", node_id: "app.py::parse_blocks",
+              observation: "output", mode_preference: "trace",
+            },
+          ],
+        }),
+      );
+    });
+  });
+
+  test("renders external boundary and observed overlay; boundary is not selectable", async () => {
+    const graphWithBoundary = {
+      ...flowGraph,
+      nodes: [
+        { ...flowGraph.nodes[0], observed: true, trace_count: 4, error_count: 1 },
+        {
+          node_id: "external::database::cursor", node_type: "external_io", symbol_id: null,
+          qualified_name: "cursor.execute", path: "(external)", line_start: 0, line_end: 0,
+          component_id: null, probe_capabilities: ["boundary"], risk: "medium",
+          denylist_hit: null, evidence: [], boundary_kind: "database", is_external: true,
+          trace_count: 0, error_count: 0, evaluation_pass: 0, evaluation_fail: 0, observed: false,
+          preview: null,
+        },
+      ],
+      edges: [{
+        edge_id: "edge::app.py::analyze_document::external::database::cursor::database::8",
+        source_node_id: "app.py::analyze_document", target_node_id: "external::database::cursor",
+        edge_type: "database", confidence: 0.5, resolution: "inferred", callee_name: "execute",
+        line: 8, evidence: [],
+        preview: {
+          recommended_mode: "trace", captured_data: ["arguments before execute()"],
+          redaction: ["truncated"], replayability: "caution", estimated_event_volume: "unknown",
+          side_effect_risk: "medium", denylist_hit: null,
+        },
+      }],
+      candidate_paths: [{
+        flow_id: "flow-1", title: "analyze_document → cursor.execute", summary: "",
+        entrypoint_node_id: "app.py::analyze_document",
+        node_ids: ["app.py::analyze_document", "external::database::cursor"],
+        node_count: 2, max_depth: 1, confidence: 0.5, unresolved_edge_count: 0,
+        external_boundary_count: 1, observed_node_count: 1, unobserved_node_ids: [],
+      }],
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(graphWithBoundary);
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("/documents/analyze"));
+
+    // Boundary node renders with a DB badge and trace overlay is shown.
+    const labels = await screen.findAllByText("cursor.execute");
+    const nodeLabel = labels.find(el => el.className.includes("font-medium"));
+    expect(screen.getByText("DB")).toBeInTheDocument();
+    expect(screen.getByText(/4 trace/)).toBeInTheDocument();
+
+    // Clicking the external boundary node must not enable plan creation.
+    fireEvent.click(nodeLabel!);
+    expect(screen.getByText("Create Probe Plan draft")).toBeDisabled();
+    expect(mockApi.post).not.toHaveBeenCalledWith(
+      "/repository/probe-plans/from-flow",
+      expect.anything(),
+    );
+
+    // Selecting the call-boundary EDGE instead targets the in-repo caller and
+    // pins snapshot/commit.
+    const edgeBtn = screen.getByText("database/inferred").closest("button");
+    fireEvent.click(edgeBtn!);
+    const createBtn = screen.getByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.objectContaining({
+          snapshot_id: 5,
+          commit_sha: "abcdef1234567890",
+          selections: [
+            {
+              target_type: "edge",
+              edge_id: "edge::app.py::analyze_document::external::database::cursor::database::8",
+              observation: "boundary", mode_preference: "trace",
+            },
+          ],
+        }),
+      );
+    });
+  });
+
+  test("detects a stale-graph 409 and prompts a reload", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.reject(new ApiError(409, "Flow graph is stale"));
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("/documents/analyze"));
+    const matches = await screen.findAllByText("parse_blocks");
+    fireEvent.click(matches.find(el => el.className.includes("font-medium"))!);
+    const createBtn = await screen.findByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+
+    // The stale banner appears and offers a reload.
+    expect(await screen.findByText("Reload graph")).toBeInTheDocument();
+    expect(screen.getByText("Create Probe Plan draft")).toBeDisabled();
   });
 });
 

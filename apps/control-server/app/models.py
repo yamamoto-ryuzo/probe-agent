@@ -1,6 +1,6 @@
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
@@ -215,6 +215,7 @@ IntelligenceRunType = Literal[
     "symbol_index",
     "feature_code_mapping",
     "probe_plan",
+    "probe_plan_from_flow",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 
@@ -689,6 +690,166 @@ class ProbePlansListOut(BaseModel):
     system_id: int
     plans: List[ProbePlanOut] = Field(default_factory=list)
     is_mock: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Flow graph explorer (Issue #43)
+# ---------------------------------------------------------------------------
+
+
+FlowEntrypointType = Literal["http_route", "public_function"]
+FlowEdgeResolution = Literal["resolved", "inferred", "unresolved"]
+
+
+class EvidenceRefOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class ProbePreviewOut(BaseModel):
+    recommended_mode: str
+    captured_data: List[str] = Field(default_factory=list)
+    redaction: List[str] = Field(default_factory=list)
+    replayability: str = ""
+    estimated_event_volume: str = ""
+    side_effect_risk: Literal["low", "medium", "high"] = "low"
+    denylist_hit: Optional[str] = None
+
+
+class FlowEntrypointOut(BaseModel):
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str
+    label: str
+    path: str
+    qualified_name: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    route_method: Optional[str] = None
+    route_path: Optional[str] = None
+
+
+class FlowEntrypointsOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    entrypoints: List[FlowEntrypointOut] = Field(default_factory=list)
+
+
+class FlowNodeOut(BaseModel):
+    node_id: str
+    node_type: str
+    symbol_id: Optional[int] = None
+    qualified_name: str
+    path: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    probe_capabilities: List[str] = Field(default_factory=list)
+    risk: Literal["low", "medium", "high"] = "low"
+    denylist_hit: Optional[str] = None
+    evidence: List[EvidenceRefOut] = Field(default_factory=list)
+    # Phase 2: external boundary classification.
+    boundary_kind: Optional[str] = None
+    is_external: bool = False
+    # Phase 2/3: runtime overlay from real traces.
+    trace_count: int = 0
+    error_count: int = 0
+    evaluation_pass: int = 0
+    evaluation_fail: int = 0
+    observed: bool = False
+    # Issue #46: pre-selection preview metadata (None for external nodes).
+    preview: Optional[ProbePreviewOut] = None
+
+
+class FlowEdgeOut(BaseModel):
+    edge_id: str
+    source_node_id: str
+    target_node_id: Optional[str] = None
+    edge_type: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    resolution: FlowEdgeResolution
+    callee_name: str
+    line: int
+    evidence: List[EvidenceRefOut] = Field(default_factory=list)
+    # Issue #46: pre-selection preview for observing this call boundary.
+    preview: Optional[ProbePreviewOut] = None
+
+
+class CandidateFlowOut(BaseModel):
+    flow_id: str
+    title: str
+    summary: str
+    entrypoint_node_id: str
+    node_ids: List[str] = Field(default_factory=list)
+    node_count: int
+    max_depth: int
+    confidence: float = Field(ge=0.0, le=1.0)
+    unresolved_edge_count: int
+    external_boundary_count: int = 0
+    observed_node_count: int = 0
+    unobserved_node_ids: List[str] = Field(default_factory=list)
+
+
+class FlowGraphOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    entrypoint: FlowEntrypointOut
+    nodes: List[FlowNodeOut] = Field(default_factory=list)
+    edges: List[FlowEdgeOut] = Field(default_factory=list)
+    candidate_paths: List[CandidateFlowOut] = Field(default_factory=list)
+    diagnostics: List[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class FlowGraphRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
+    # Issue #46: optional pinning. When provided they must match the latest
+    # ready snapshot or the request is rejected as stale (409).
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+
+
+class FlowProbeSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Issue #46: node selections instrument a symbol; edge selections observe
+    # a call boundary on the in-repo caller.
+    target_type: Literal["node", "edge"] = "node"
+    node_id: Optional[str] = None
+    edge_id: Optional[str] = None
+    observation: Literal["input", "output", "boundary"] = "output"
+    mode_preference: Literal["trace", "shadow", "off"] = "trace"
+
+    @model_validator(mode="after")
+    def _check_target(self) -> "FlowProbeSelection":
+        if self.target_type == "node" and not self.node_id:
+            raise ValueError("node_id is required for node selections")
+        if self.target_type == "edge" and not self.edge_id:
+            raise ValueError("edge_id is required for edge selections")
+        return self
+
+
+class ProbePlanFromFlowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    objective: str = ""
+    selections: List[FlowProbeSelection] = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
+    # Issue #46: pin the plan to the graph the user actually reviewed.
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
 
 
 Role = Literal["admin", "user"]
