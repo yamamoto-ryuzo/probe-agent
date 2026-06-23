@@ -5,6 +5,7 @@ import type {
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut,
+  FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
@@ -298,6 +299,38 @@ export function useUpdateProbePointStatus() {
   return useMutation({
     mutationFn: ({ pointId, status }: { pointId: number; status: string }) =>
       api.put(`/repository/probe-points/${pointId}/status`, { status }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
+  });
+}
+
+export function useFlowEntrypoints() {
+  return useQuery({
+    queryKey: sysKey("flowEntrypoints"),
+    queryFn: () => api.get<FlowEntrypointsOut>("/repository/flow-entrypoints"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useBuildFlowGraph() {
+  return useMutation({
+    mutationFn: (body: {
+      entrypoint_type: string;
+      entrypoint_id: string;
+      max_depth?: number;
+      max_nodes?: number;
+    }) => api.post<FlowGraphOut>("/repository/flow-graphs", body),
+  });
+}
+
+export function useCreatePlanFromFlow() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      entrypoint_type: string;
+      entrypoint_id: string;
+      objective?: string;
+      selections: FlowProbeSelection[];
+    }) => api.post<ProbePlanOut>("/repository/probe-plans/from-flow", body),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });
 }

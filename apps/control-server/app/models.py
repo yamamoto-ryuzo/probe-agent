@@ -215,6 +215,7 @@ IntelligenceRunType = Literal[
     "symbol_index",
     "feature_code_mapping",
     "probe_plan",
+    "probe_plan_from_flow",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
 
@@ -689,6 +690,121 @@ class ProbePlansListOut(BaseModel):
     system_id: int
     plans: List[ProbePlanOut] = Field(default_factory=list)
     is_mock: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Flow graph explorer (Issue #43)
+# ---------------------------------------------------------------------------
+
+
+FlowEntrypointType = Literal["http_route", "public_function"]
+FlowEdgeResolution = Literal["resolved", "inferred", "unresolved"]
+
+
+class EvidenceRefOut(BaseModel):
+    path: str
+    start_line: int
+    end_line: int
+    summary: str = ""
+
+
+class FlowEntrypointOut(BaseModel):
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str
+    label: str
+    path: str
+    qualified_name: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    route_method: Optional[str] = None
+    route_path: Optional[str] = None
+
+
+class FlowEntrypointsOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    entrypoints: List[FlowEntrypointOut] = Field(default_factory=list)
+
+
+class FlowNodeOut(BaseModel):
+    node_id: str
+    node_type: str
+    symbol_id: Optional[int] = None
+    qualified_name: str
+    path: str
+    line_start: int
+    line_end: int
+    component_id: Optional[str] = None
+    probe_capabilities: List[str] = Field(default_factory=list)
+    risk: Literal["low", "medium", "high"] = "low"
+    denylist_hit: Optional[str] = None
+    evidence: List[EvidenceRefOut] = Field(default_factory=list)
+
+
+class FlowEdgeOut(BaseModel):
+    source_node_id: str
+    target_node_id: Optional[str] = None
+    edge_type: str
+    confidence: float = Field(ge=0.0, le=1.0)
+    resolution: FlowEdgeResolution
+    callee_name: str
+    line: int
+    evidence: List[EvidenceRefOut] = Field(default_factory=list)
+
+
+class CandidateFlowOut(BaseModel):
+    flow_id: str
+    title: str
+    summary: str
+    entrypoint_node_id: str
+    node_ids: List[str] = Field(default_factory=list)
+    node_count: int
+    max_depth: int
+    confidence: float = Field(ge=0.0, le=1.0)
+    unresolved_edge_count: int
+
+
+class FlowGraphOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    commit_sha: str
+    entrypoint: FlowEntrypointOut
+    nodes: List[FlowNodeOut] = Field(default_factory=list)
+    edges: List[FlowEdgeOut] = Field(default_factory=list)
+    candidate_paths: List[CandidateFlowOut] = Field(default_factory=list)
+    diagnostics: List[str] = Field(default_factory=list)
+    truncated: bool = False
+
+
+class FlowGraphRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
+
+
+class FlowProbeSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    node_id: str = Field(..., min_length=1)
+    # Which observation the probe targets at this node.
+    observation: Literal["input", "output", "boundary"] = "output"
+    mode_preference: Literal["trace", "shadow", "off"] = "trace"
+
+
+class ProbePlanFromFlowRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    entrypoint_type: FlowEntrypointType
+    entrypoint_id: str = Field(..., min_length=1)
+    objective: str = ""
+    selections: List[FlowProbeSelection] = Field(..., min_length=1)
+    max_depth: int = Field(default=8, ge=1, le=32)
+    max_nodes: int = Field(default=100, ge=1, le=500)
 
 
 Role = Literal["admin", "user"]

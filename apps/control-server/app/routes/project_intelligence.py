@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 import hashlib
 from dataclasses import replace
@@ -30,8 +31,17 @@ from ..git_ops import (
 )
 from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
 from ..models import (
+    CandidateFlowOut,
     CodeSymbolOut,
     DraftGenerationResult,
+    EvidenceRefOut,
+    FlowEdgeOut,
+    FlowEntrypointOut,
+    FlowEntrypointsOut,
+    FlowGraphOut,
+    FlowGraphRequest,
+    FlowNodeOut,
+    ProbePlanFromFlowRequest,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -1716,6 +1726,341 @@ def update_probe_point_status(
             "SELECT * FROM probe_points WHERE id = ?", (point_id,),
         ).fetchone()
         return _probe_point_out(row)
+
+
+# ---------------------------------------------------------------------------
+# Flow graph explorer (Issue #43, Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _latest_ready_snapshot(conn, system_id: int):
+    return conn.execute(
+        """SELECT * FROM repository_snapshots
+           WHERE system_id = ? AND status = 'ready'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+
+
+def _load_flow_inputs(system_id: int):
+    """Load snapshot symbols and indexed Python sources for flow building.
+
+    Returns ``(snapshot_row, symbol_records, files)`` or raises HTTPException.
+    Only committed-snapshot content is read; no working-tree access.
+    """
+    from ..flow_graph import SymbolRecord
+
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No ready snapshot. Create a snapshot first.",
+            )
+        snapshot_id = snapshot_row["id"]
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchall()
+        file_rows = conn.execute(
+            """SELECT path, content FROM snapshot_files
+               WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+                 AND path LIKE '%.py'
+               ORDER BY path""",
+            (snapshot_id,),
+        ).fetchall()
+
+    if not sym_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No symbols indexed for the latest snapshot. Run symbol indexing first.",
+        )
+
+    symbols = [
+        SymbolRecord(
+            symbol_id=r["id"],
+            path=r["path"],
+            qualified_name=r["qualified_name"],
+            kind=r["kind"],
+            start_line=r["start_line"],
+            end_line=r["end_line"],
+            decorators=json.loads(r["decorators"]),
+            component_id=r["component_id"],
+            route_path=r["route_path"],
+            route_method=r["route_method"],
+            docstring=r["docstring"],
+            is_test=bool(r["is_test"]),
+        )
+        for r in sym_rows
+    ]
+    files = [
+        (fr["path"], bytes(fr["content"] or b"").decode("utf-8", errors="replace"))
+        for fr in file_rows
+    ]
+    return snapshot_row, symbols, files
+
+
+def _evidence_refs_out(evidence) -> List[EvidenceRefOut]:
+    return [
+        EvidenceRefOut(
+            path=e.path, start_line=e.start_line, end_line=e.end_line, summary=e.summary,
+        )
+        for e in evidence
+    ]
+
+
+@router.get("/repository/flow-entrypoints", response_model=FlowEntrypointsOut)
+def list_flow_entrypoints(
+    system_id: int = Depends(get_system_id),
+) -> FlowEntrypointsOut:
+    from ..flow_graph import list_entrypoints
+
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            return FlowEntrypointsOut(system_id=system_id)
+    _, symbols, _ = _load_flow_inputs(system_id)
+    entrypoints = list_entrypoints(symbols)
+    return FlowEntrypointsOut(
+        system_id=system_id,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoints=[
+            FlowEntrypointOut(
+                entrypoint_type=e.entrypoint_type,
+                entrypoint_id=e.entrypoint_id,
+                label=e.label,
+                path=e.path,
+                qualified_name=e.qualified_name,
+                line_start=e.line_start,
+                line_end=e.line_end,
+                component_id=e.component_id,
+                route_method=e.route_method,
+                route_path=e.route_path,
+            )
+            for e in entrypoints
+        ],
+    )
+
+
+def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
+    ep = graph.entrypoint
+    return FlowGraphOut(
+        system_id=system_id,
+        snapshot_id=graph.snapshot_id,
+        commit_sha=graph.commit_sha,
+        entrypoint=FlowEntrypointOut(
+            entrypoint_type=ep.entrypoint_type,
+            entrypoint_id=ep.entrypoint_id,
+            label=ep.label,
+            path=ep.path,
+            qualified_name=ep.qualified_name,
+            line_start=ep.line_start,
+            line_end=ep.line_end,
+            component_id=ep.component_id,
+            route_method=ep.route_method,
+            route_path=ep.route_path,
+        ),
+        nodes=[
+            FlowNodeOut(
+                node_id=n.node_id,
+                node_type=n.node_type,
+                symbol_id=n.symbol_id,
+                qualified_name=n.qualified_name,
+                path=n.path,
+                line_start=n.line_start,
+                line_end=n.line_end,
+                component_id=n.component_id,
+                probe_capabilities=n.probe_capabilities,
+                risk=n.risk,
+                denylist_hit=n.denylist_hit,
+                evidence=_evidence_refs_out(n.evidence),
+            )
+            for n in graph.nodes
+        ],
+        edges=[
+            FlowEdgeOut(
+                source_node_id=e.source_node_id,
+                target_node_id=e.target_node_id,
+                edge_type=e.edge_type,
+                confidence=e.confidence,
+                resolution=e.resolution,
+                callee_name=e.callee_name,
+                line=e.line,
+                evidence=_evidence_refs_out(e.evidence),
+            )
+            for e in graph.edges
+        ],
+        candidate_paths=[
+            CandidateFlowOut(
+                flow_id=c.flow_id,
+                title=c.title,
+                summary=c.summary,
+                entrypoint_node_id=c.entrypoint_node_id,
+                node_ids=c.node_ids,
+                node_count=c.node_count,
+                max_depth=c.max_depth,
+                confidence=c.confidence,
+                unresolved_edge_count=c.unresolved_edge_count,
+            )
+            for c in graph.candidate_paths
+        ],
+        diagnostics=graph.diagnostics,
+        truncated=graph.truncated,
+    )
+
+
+@router.post("/repository/flow-graphs", response_model=FlowGraphOut)
+def build_flow_graph_endpoint(
+    payload: FlowGraphRequest,
+    system_id: int = Depends(get_system_id),
+) -> FlowGraphOut:
+    from ..flow_graph import build_flow_graph
+
+    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+    )
+    if graph is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entrypoint not found in snapshot: {payload.entrypoint_id}",
+        )
+    return _flow_graph_out(system_id, graph)
+
+
+def _component_id_for(qualified_name: str) -> str:
+    base = qualified_name.rsplit(".", 1)[-1]
+    kebab = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return f"{kebab}-observer" if kebab else "flow-observer"
+
+
+@router.post(
+    "/repository/probe-plans/from-flow",
+    response_model=ProbePlanOut,
+    status_code=201,
+)
+def create_probe_plan_from_flow(
+    payload: ProbePlanFromFlowRequest,
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    """Convert user-selected flow nodes into a manual Probe Plan draft.
+
+    This is an explicit, user-driven selection (decision_method=manual). It
+    only records a draft; it does not generate, apply, or run any patch.
+    """
+    from ..flow_graph import build_flow_graph
+    from ..probe_planner import check_denylist
+
+    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+    )
+    if graph is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Entrypoint not found in snapshot: {payload.entrypoint_id}",
+        )
+
+    nodes_by_id = {n.node_id: n for n in graph.nodes}
+    selected = []
+    for sel in payload.selections:
+        node = nodes_by_id.get(sel.node_id)
+        if node is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Selected node is not part of this flow graph: {sel.node_id}",
+            )
+        selected.append((sel, node))
+
+    snapshot_id = snapshot_row["id"]
+    now = time.time()
+    feature_id = payload.entrypoint_id
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan_from_flow', 'manual', 'n/a',
+                           'flow-v1', 'flow-v1', 'manual',
+                           'completed', 0, ?, ?)""",
+                (system_id, snapshot_id, now, now),
+            )
+            run_id = cur.lastrowid
+
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id,
+                        feature_id, objective, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                (
+                    system_id, snapshot_id, run_id, feature_id,
+                    payload.objective.strip(), now, now,
+                ),
+            )
+            plan_id = cur.lastrowid
+
+            for sel, node in selected:
+                denylist_hit = check_denylist(node.qualified_name)
+                risk = "high" if denylist_hit else node.risk
+                observation = {
+                    "input": "function input",
+                    "output": "function output / return / error",
+                    "boundary": "call boundary (before/after)",
+                }[sel.observation]
+                reason = (
+                    f"User-selected from execution flow '{graph.entrypoint.label}'. "
+                    f"Observe {observation}."
+                )
+                replayability = (
+                    "Review before shadow; selected from static flow only."
+                    if risk != "low"
+                    else "Read-oriented node selected for tracing."
+                )
+                conn.execute(
+                    """INSERT INTO probe_points
+                           (plan_id, system_id, component_id, feature_id,
+                            path, symbol, line_start, line_end, reason,
+                            recommended_mode, side_effect_risk, replayability,
+                            denylist_hit, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                    (
+                        plan_id, system_id,
+                        node.component_id or _component_id_for(node.qualified_name),
+                        feature_id, node.path, node.qualified_name,
+                        node.line_start, node.line_end, reason,
+                        sel.mode_preference, risk, replayability,
+                        denylist_hit, now, now,
+                    ),
+                )
+
+            plan_row = conn.execute(
+                "SELECT * FROM probe_plans WHERE id = ?", (plan_id,),
+            ).fetchone()
+            result = _probe_plan_out(conn, plan_row)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return result
 
 
 # ---------------------------------------------------------------------------

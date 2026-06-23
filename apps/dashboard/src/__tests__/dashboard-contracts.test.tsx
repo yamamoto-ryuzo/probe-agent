@@ -410,6 +410,113 @@ describe("Probe Patch application", () => {
   });
 });
 
+// ── Flow Explorer tests ─────────────────────────────────────────────
+
+describe("Flow Explorer page", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockSystemId = 1;
+  });
+
+  const flowGraph = {
+    system_id: 1,
+    snapshot_id: 5,
+    commit_sha: "abcdef1234567890",
+    entrypoint: {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", path: "app.py", qualified_name: "analyze_document",
+      line_start: 5, line_end: 11, component_id: null, route_method: "POST", route_path: "/documents/analyze",
+    },
+    nodes: [
+      {
+        node_id: "app.py::analyze_document", node_type: "http_route", symbol_id: 1,
+        qualified_name: "analyze_document", path: "app.py", line_start: 5, line_end: 11,
+        component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
+        risk: "low", denylist_hit: null, evidence: [],
+      },
+      {
+        node_id: "app.py::parse_blocks", node_type: "function", symbol_id: 2,
+        qualified_name: "parse_blocks", path: "app.py", line_start: 14, line_end: 15,
+        component_id: null, probe_capabilities: ["input", "output", "error", "duration"],
+        risk: "low", denylist_hit: null, evidence: [],
+      },
+    ],
+    edges: [
+      {
+        source_node_id: "app.py::analyze_document", target_node_id: "app.py::parse_blocks",
+        edge_type: "call", confidence: 1.0, resolution: "resolved", callee_name: "parse_blocks",
+        line: 7, evidence: [],
+      },
+    ],
+    candidate_paths: [
+      {
+        flow_id: "flow-1", title: "analyze_document → parse_blocks", summary: "",
+        entrypoint_node_id: "app.py::analyze_document",
+        node_ids: ["app.py::analyze_document", "app.py::parse_blocks"],
+        node_count: 2, max_depth: 1, confidence: 1.0, unresolved_edge_count: 0,
+      },
+    ],
+    diagnostics: [],
+    truncated: false,
+  };
+
+  test("builds graph and creates a manual plan from selected nodes", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.resolve({ id: 42, status: "proposed", probe_points: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    // Open the entrypoint -> builds the graph.
+    const entrypointBtn = await screen.findByText("/documents/analyze");
+    fireEvent.click(entrypointBtn);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith("/repository/flow-graphs", {
+        entrypoint_type: "http_route",
+        entrypoint_id: "POST:/documents/analyze",
+      });
+    });
+
+    // Select the parse_blocks node from the graph (the node label, not the
+    // edge target label which shares the same text).
+    const matches = await screen.findAllByText("parse_blocks");
+    const nodeLabel = matches.find(el => el.className.includes("font-medium"));
+    fireEvent.click(nodeLabel!);
+
+    const createBtn = await screen.findByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.objectContaining({
+          entrypoint_type: "http_route",
+          entrypoint_id: "POST:/documents/analyze",
+          selections: [
+            { node_id: "app.py::parse_blocks", observation: "output", mode_preference: "trace" },
+          ],
+        }),
+      );
+    });
+  });
+});
+
 // ── Decision Workspace tests ────────────────────────────────────────
 
 function setupWorkspaceMocks(overrides: { workspaces?: unknown[]; detail?: unknown; contextPack?: unknown } = {}) {
