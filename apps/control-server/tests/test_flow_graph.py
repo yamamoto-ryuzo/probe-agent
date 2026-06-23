@@ -788,6 +788,213 @@ class TestProbePlanFromFlow:
         assert before == after
 
 
+class TestEdgeIdAndPreview:
+    """Issue #46: stable edge ids and pre-selection preview metadata."""
+
+    def test_edges_have_stable_ids_and_preview(self, admin_client, git_repo, monkeypatch):
+        from app.flow_graph import SymbolRecord, build_flow_graph, _edge_id
+
+        records = _records_from_source("a.py", SAMPLE_SOURCE)
+        g1 = build_flow_graph(
+            records, [("a.py", SAMPLE_SOURCE)], 1, "x",
+            "http_route", "POST:/documents/analyze",
+        )
+        g2 = build_flow_graph(
+            list(reversed(records)), [("a.py", SAMPLE_SOURCE)], 1, "x",
+            "http_route", "POST:/documents/analyze",
+        )
+        assert [e.edge_id for e in g1.edges] == [e.edge_id for e in g2.edges]
+        # The id is reconstructable from its parts.
+        e = g1.edges[0]
+        assert e.edge_id == _edge_id(
+            e.source_node_id, e.target_node_id, e.edge_type, e.callee_name, e.line,
+        )
+
+    def test_api_returns_node_and_edge_previews(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "preview")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        r = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        node = [n for n in data["nodes"] if n["qualified_name"] == "parse_blocks"][0]
+        prev = node["preview"]
+        assert prev is not None
+        assert prev["captured_data"]
+        assert prev["redaction"]
+        assert prev["replayability"]
+        assert prev["estimated_event_volume"]
+        assert prev["recommended_mode"] in ("trace", "shadow", "off")
+        # Edges carry an id and a boundary preview.
+        for edge in data["edges"]:
+            assert edge["edge_id"]
+            assert edge["preview"] is not None
+        # External nodes do not advertise an instrumentation preview.
+        ext = [n for n in data["nodes"] if n["is_external"]]
+        assert all(n["preview"] is None for n in ext)
+
+
+class TestEdgeSelection:
+    """Issue #46: selecting an edge/boundary maps to the in-repo caller."""
+
+    def test_edge_selection_targets_in_repo_caller(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "edgesel")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        # Pick the boundary edge to the external http node.
+        ext = [n for n in graph["nodes"] if n["is_external"]][0]
+        edge = [e for e in graph["edges"] if e["target_node_id"] == ext["node_id"]][0]
+        caller = [n for n in graph["nodes"] if n["node_id"] == edge["source_node_id"]][0]
+
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [
+                    {"target_type": "edge", "edge_id": edge["edge_id"],
+                     "mode_preference": "trace"},
+                ],
+            },
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+        pt = r.json()["probe_points"][0]
+        # Instruments the in-repo caller, not the external boundary node.
+        assert pt["symbol"] == caller["qualified_name"]
+        assert pt["path"] == caller["path"]
+        assert "boundary" in pt["reason"].lower()
+        assert edge["callee_name"] in pt["reason"]
+        # External-crossing boundary escalates side-effect risk above low.
+        assert pt["side_effect_risk"] in ("medium", "high")
+
+    def test_edge_selection_unknown_edge_400(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "edgebad")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [{"target_type": "edge", "edge_id": "edge::ghost"}],
+            },
+            headers=h,
+        )
+        assert r.status_code == 400
+
+    def test_edge_selection_requires_edge_id(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "edgereq")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "selections": [{"target_type": "edge"}],
+            },
+            headers=h,
+        )
+        assert r.status_code == 422  # schema validation
+
+
+class TestSnapshotPinning:
+    """Issue #46: stale graph detection via snapshot_id / commit_sha."""
+
+    def test_stale_snapshot_rejected_on_build(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "stalebuild")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        r = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze",
+                  "snapshot_id": 999999, "commit_sha": "deadbeef"},
+            headers=h,
+        )
+        assert r.status_code == 409
+        assert "stale" in r.json()["detail"].lower()
+
+    def test_stale_snapshot_rejected_on_plan_creation(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "staleplan")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        node = [n for n in graph["nodes"] if n["qualified_name"] == "parse_blocks"][0]
+
+        # A new snapshot makes the previously viewed graph stale.
+        r = admin_client.post("/repository/snapshots", headers=h)
+        assert r.status_code == 201, r.text
+        admin_client.post("/repository/symbols/index", headers=h)
+
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [{"node_id": node["node_id"], "observation": "output",
+                                "mode_preference": "trace"}],
+            },
+            headers=h,
+        )
+        assert r.status_code == 409
+        assert "stale" in r.json()["detail"].lower()
+
+    def test_matching_snapshot_accepted(self, admin_client, git_repo, monkeypatch):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "freshplan")
+        h = _setup_snapshot(admin_client, token, system["id"], git_repo)
+        graph = admin_client.post(
+            "/repository/flow-graphs",
+            json={"entrypoint_type": "http_route",
+                  "entrypoint_id": "POST:/documents/analyze"},
+            headers=h,
+        ).json()
+        node = [n for n in graph["nodes"] if n["qualified_name"] == "parse_blocks"][0]
+        r = admin_client.post(
+            "/repository/probe-plans/from-flow",
+            json={
+                "entrypoint_type": "http_route",
+                "entrypoint_id": "POST:/documents/analyze",
+                "snapshot_id": graph["snapshot_id"],
+                "commit_sha": graph["commit_sha"],
+                "selections": [{"node_id": node["node_id"], "observation": "output",
+                                "mode_preference": "trace"}],
+            },
+            headers=h,
+        )
+        assert r.status_code == 201, r.text
+
+
 class TestSystemScoping:
     def test_graph_inputs_are_system_scoped(self, admin_client, git_repo, monkeypatch):
         token = _login(admin_client)

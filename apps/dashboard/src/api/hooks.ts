@@ -318,6 +318,8 @@ export function useBuildFlowGraph() {
       entrypoint_id: string;
       max_depth?: number;
       max_nodes?: number;
+      snapshot_id?: number;
+      commit_sha?: string;
     }) => api.post<FlowGraphOut>("/repository/flow-graphs", body),
   });
 }
@@ -330,6 +332,8 @@ export function useCreatePlanFromFlow() {
       entrypoint_id: string;
       objective?: string;
       selections: FlowProbeSelection[];
+      snapshot_id?: number;
+      commit_sha?: string;
     }) => api.post<ProbePlanOut>("/repository/probe-plans/from-flow", body),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("probePlans") }),
   });

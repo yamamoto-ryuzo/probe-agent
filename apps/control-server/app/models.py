@@ -1,6 +1,6 @@
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Mode = Literal["off", "trace", "shadow"]
 Evaluation = Literal["better", "worse", "same", "unknown"]
@@ -708,6 +708,16 @@ class EvidenceRefOut(BaseModel):
     summary: str = ""
 
 
+class ProbePreviewOut(BaseModel):
+    recommended_mode: str
+    captured_data: List[str] = Field(default_factory=list)
+    redaction: List[str] = Field(default_factory=list)
+    replayability: str = ""
+    estimated_event_volume: str = ""
+    side_effect_risk: Literal["low", "medium", "high"] = "low"
+    denylist_hit: Optional[str] = None
+
+
 class FlowEntrypointOut(BaseModel):
     entrypoint_type: FlowEntrypointType
     entrypoint_id: str
@@ -750,9 +760,12 @@ class FlowNodeOut(BaseModel):
     evaluation_pass: int = 0
     evaluation_fail: int = 0
     observed: bool = False
+    # Issue #46: pre-selection preview metadata (None for external nodes).
+    preview: Optional[ProbePreviewOut] = None
 
 
 class FlowEdgeOut(BaseModel):
+    edge_id: str
     source_node_id: str
     target_node_id: Optional[str] = None
     edge_type: str
@@ -761,6 +774,8 @@ class FlowEdgeOut(BaseModel):
     callee_name: str
     line: int
     evidence: List[EvidenceRefOut] = Field(default_factory=list)
+    # Issue #46: pre-selection preview for observing this call boundary.
+    preview: Optional[ProbePreviewOut] = None
 
 
 class CandidateFlowOut(BaseModel):
@@ -797,15 +812,30 @@ class FlowGraphRequest(BaseModel):
     entrypoint_id: str = Field(..., min_length=1)
     max_depth: int = Field(default=8, ge=1, le=32)
     max_nodes: int = Field(default=100, ge=1, le=500)
+    # Issue #46: optional pinning. When provided they must match the latest
+    # ready snapshot or the request is rejected as stale (409).
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
 
 
 class FlowProbeSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    node_id: str = Field(..., min_length=1)
-    # Which observation the probe targets at this node.
+    # Issue #46: node selections instrument a symbol; edge selections observe
+    # a call boundary on the in-repo caller.
+    target_type: Literal["node", "edge"] = "node"
+    node_id: Optional[str] = None
+    edge_id: Optional[str] = None
     observation: Literal["input", "output", "boundary"] = "output"
     mode_preference: Literal["trace", "shadow", "off"] = "trace"
+
+    @model_validator(mode="after")
+    def _check_target(self) -> "FlowProbeSelection":
+        if self.target_type == "node" and not self.node_id:
+            raise ValueError("node_id is required for node selections")
+        if self.target_type == "edge" and not self.edge_id:
+            raise ValueError("edge_id is required for edge selections")
+        return self
 
 
 class ProbePlanFromFlowRequest(BaseModel):
@@ -817,6 +847,9 @@ class ProbePlanFromFlowRequest(BaseModel):
     selections: List[FlowProbeSelection] = Field(..., min_length=1)
     max_depth: int = Field(default=8, ge=1, le=32)
     max_nodes: int = Field(default=100, ge=1, le=500)
+    # Issue #46: pin the plan to the graph the user actually reviewed.
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
 
 
 Role = Literal["admin", "user"]

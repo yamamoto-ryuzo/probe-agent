@@ -296,6 +296,16 @@ export interface EvidenceRefOut {
   summary: string;
 }
 
+export interface ProbePreviewOut {
+  recommended_mode: string;
+  captured_data: string[];
+  redaction: string[];
+  replayability: string;
+  estimated_event_volume: string;
+  side_effect_risk: "low" | "medium" | "high";
+  denylist_hit: string | null;
+}
+
 export interface FlowEntrypointOut {
   entrypoint_type: "http_route" | "public_function";
   entrypoint_id: string;
@@ -336,9 +346,11 @@ export interface FlowNodeOut {
   evaluation_pass: number;
   evaluation_fail: number;
   observed: boolean;
+  preview: ProbePreviewOut | null;
 }
 
 export interface FlowEdgeOut {
+  edge_id: string;
   source_node_id: string;
   target_node_id: string | null;
   edge_type: string;
@@ -347,6 +359,7 @@ export interface FlowEdgeOut {
   callee_name: string;
   line: number;
   evidence: EvidenceRefOut[];
+  preview: ProbePreviewOut | null;
 }
 
 export interface CandidateFlowOut {
@@ -377,7 +390,9 @@ export interface FlowGraphOut {
 }
 
 export interface FlowProbeSelection {
-  node_id: string;
+  target_type: "node" | "edge";
+  node_id?: string;
+  edge_id?: string;
   observation: "input" | "output" | "boundary";
   mode_preference: "trace" | "shadow" | "off";
 }

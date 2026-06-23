@@ -109,6 +109,7 @@ class FlowNode:
 
 @dataclass
 class FlowEdge:
+    edge_id: str
     source_node_id: str
     target_node_id: Optional[str]
     # call | await | dispatch | http | database | filesystem
@@ -168,6 +169,15 @@ class _CallSite:
 
 def _node_id(path: str, qualified_name: str) -> str:
     return f"{path}::{qualified_name}"
+
+
+def _edge_id(
+    source_id: str, target_id: Optional[str], edge_type: str,
+    callee_name: str, line: int,
+) -> str:
+    """Stable, input-order-independent identifier for an edge."""
+    tgt = target_id if target_id is not None else f"unresolved:{callee_name}"
+    return f"edge::{source_id}::{tgt}::{edge_type}::{line}"
 
 
 def _callee_name(func: ast.expr) -> Tuple[Optional[str], bool, Optional[str], str]:
@@ -325,6 +335,128 @@ def _classify_boundary(site: _CallSite) -> Optional[Tuple[str, str, str, str]]:
 
 def _external_node_id(boundary_kind: str, label: str) -> str:
     return f"external::{boundary_kind}::{label}"
+
+
+# ---------------------------------------------------------------------------
+# Probe preview metadata (Issue #46)
+#
+# Deterministic, pre-selection preview of what instrumenting a node or
+# observing a call boundary would capture, plus redaction, replayability, and
+# an estimated event volume derived from historical traces. No LLM inference.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProbePreview:
+    recommended_mode: str  # trace | shadow | off
+    captured_data: List[str]
+    redaction: List[str]
+    replayability: str
+    estimated_event_volume: str
+    side_effect_risk: str
+    denylist_hit: Optional[str]
+
+
+def _recommended_mode(risk: str, denylist_hit: Optional[str]) -> str:
+    if denylist_hit or risk == "high":
+        return "off"
+    return "trace"
+
+
+def _redaction_notes(
+    risk: str, denylist_hit: Optional[str], boundary: bool = False,
+) -> List[str]:
+    notes = ["String inputs/outputs are truncated to the capture limit before storage."]
+    if denylist_hit:
+        notes.insert(
+            0, "Safety denylist match: payload capture is blocked and heavily redacted.",
+        )
+    if risk in ("medium", "high") or boundary:
+        notes.append("Potentially sensitive arguments are redacted before storage.")
+    return notes
+
+
+def _replayability_note(
+    risk: str, denylist_hit: Optional[str], boundary: bool = False,
+) -> str:
+    if denylist_hit or risk == "high":
+        return "Not safely replayable: may cause side effects; review before shadow mode."
+    if risk == "medium" or boundary:
+        return "Replay with caution: the call may have side effects."
+    return "Read-oriented: safe to replay with the same input."
+
+
+def _estimated_volume(trace_count: int) -> str:
+    if trace_count <= 0:
+        return "No historical traces; event volume is unknown until probing is enabled."
+    if trace_count < 100:
+        return f"Low (~{trace_count} events observed historically)."
+    if trace_count < 1000:
+        return f"Medium (~{trace_count} events observed historically)."
+    return f"High (~{trace_count}+ events observed historically)."
+
+
+def build_node_preview(node: FlowNode) -> ProbePreview:
+    cap_map = {
+        "input": "function input arguments",
+        "output": "return value",
+        "error": "raised exceptions",
+        "duration": "execution duration (ms)",
+        "boundary": "call boundary before/after values",
+    }
+    captured = [cap_map.get(c, c) for c in node.probe_capabilities]
+    return ProbePreview(
+        recommended_mode=_recommended_mode(node.risk, node.denylist_hit),
+        captured_data=captured,
+        redaction=_redaction_notes(node.risk, node.denylist_hit),
+        replayability=_replayability_note(node.risk, node.denylist_hit),
+        estimated_event_volume=_estimated_volume(node.trace_count),
+        side_effect_risk=node.risk,
+        denylist_hit=node.denylist_hit,
+    )
+
+
+def edge_boundary_risk(
+    source_node: Optional[FlowNode], target_node: Optional[FlowNode],
+) -> Tuple[str, Optional[str]]:
+    """Derive the side-effect risk and denylist hit for observing a boundary.
+
+    The instrumented target is the in-repo caller; risk is escalated when the
+    boundary crosses an external side-effecting node.
+    """
+    risk = source_node.risk if source_node else "low"
+    denylist_hit = source_node.denylist_hit if source_node else None
+    boundary = target_node is not None and target_node.is_external
+    if boundary and risk == "low":
+        risk = "medium"
+    if target_node is not None and target_node.risk == "high":
+        risk = "high"
+        denylist_hit = denylist_hit or target_node.denylist_hit
+    return risk, denylist_hit
+
+
+def build_edge_preview(
+    edge: FlowEdge, source_node: Optional[FlowNode], target_node: Optional[FlowNode],
+) -> ProbePreview:
+    boundary = target_node is not None and target_node.is_external
+    callee = edge.callee_name
+    captured = [
+        f"arguments passed to {callee}() (before the call)",
+        f"value returned from {callee}() (after the call)",
+        f"exceptions raised by {callee}()",
+        "elapsed time across the call",
+    ]
+    risk, denylist_hit = edge_boundary_risk(source_node, target_node)
+    trace_count = source_node.trace_count if source_node else 0
+    return ProbePreview(
+        recommended_mode=_recommended_mode(risk, denylist_hit),
+        captured_data=captured,
+        redaction=_redaction_notes(risk, denylist_hit, boundary=True),
+        replayability=_replayability_note(risk, denylist_hit, boundary=boundary),
+        estimated_event_volume=_estimated_volume(trace_count),
+        side_effect_risk=risk,
+        denylist_hit=denylist_hit,
+    )
 
 
 def _make_external_node(boundary_kind: str, label: str, dotted: str) -> FlowNode:
@@ -574,6 +706,9 @@ def build_flow_graph(
                     continue
                 seen_edges.add(edge_key)
                 edges.append(FlowEdge(
+                    edge_id=_edge_id(
+                        source_id, ext_id, edge_type, site.callee_name, site.line,
+                    ),
                     source_node_id=source_id,
                     target_node_id=ext_id,
                     edge_type=edge_type,
@@ -603,6 +738,9 @@ def build_flow_graph(
                     continue
                 seen_edges.add(edge_key)
                 edges.append(FlowEdge(
+                    edge_id=_edge_id(
+                        source_id, None, site.edge_type, site.callee_name, site.line,
+                    ),
                     source_node_id=source_id,
                     target_node_id=None,
                     edge_type=site.edge_type,
@@ -625,6 +763,9 @@ def build_flow_graph(
                 continue
             seen_edges.add(edge_key)
             edges.append(FlowEdge(
+                edge_id=_edge_id(
+                    source_id, target_id, site.edge_type, site.callee_name, site.line,
+                ),
                 source_node_id=source_id,
                 target_node_id=target_id,
                 edge_type=site.edge_type,

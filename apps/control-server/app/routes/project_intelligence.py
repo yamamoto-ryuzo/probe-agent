@@ -42,6 +42,7 @@ from ..models import (
     FlowGraphRequest,
     FlowNodeOut,
     ProbePlanFromFlowRequest,
+    ProbePreviewOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -1742,11 +1743,19 @@ def _latest_ready_snapshot(conn, system_id: int):
     ).fetchone()
 
 
-def _load_flow_inputs(system_id: int):
+def _load_flow_inputs(
+    system_id: int,
+    expected_snapshot_id: Optional[int] = None,
+    expected_commit_sha: Optional[str] = None,
+):
     """Load snapshot symbols and indexed Python sources for flow building.
 
     Returns ``(snapshot_row, symbol_records, files)`` or raises HTTPException.
     Only committed-snapshot content is read; no working-tree access.
+
+    When ``expected_snapshot_id`` / ``expected_commit_sha`` are supplied they
+    must match the current latest ready snapshot; otherwise the caller's graph
+    is stale (a newer snapshot exists) and a 409 is raised so the UI reloads.
     """
     from ..flow_graph import SymbolRecord
 
@@ -1758,6 +1767,23 @@ def _load_flow_inputs(system_id: int):
                 detail="No ready snapshot. Create a snapshot first.",
             )
         snapshot_id = snapshot_row["id"]
+
+        if (
+            expected_snapshot_id is not None
+            and expected_snapshot_id != snapshot_id
+        ) or (
+            expected_commit_sha is not None
+            and expected_commit_sha != snapshot_row["commit_sha"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Flow graph is stale: a newer snapshot exists "
+                    f"(requested snapshot {expected_snapshot_id}/"
+                    f"{expected_commit_sha}, current {snapshot_id}/"
+                    f"{snapshot_row['commit_sha']}). Reload the flow graph."
+                ),
+            )
         sym_rows = conn.execute(
             "SELECT * FROM code_symbols WHERE snapshot_id = ? AND system_id = ?",
             (snapshot_id, system_id),
@@ -1843,8 +1869,23 @@ def list_flow_entrypoints(
     )
 
 
+def _preview_out(preview) -> ProbePreviewOut:
+    return ProbePreviewOut(
+        recommended_mode=preview.recommended_mode,
+        captured_data=preview.captured_data,
+        redaction=preview.redaction,
+        replayability=preview.replayability,
+        estimated_event_volume=preview.estimated_event_volume,
+        side_effect_risk=preview.side_effect_risk,
+        denylist_hit=preview.denylist_hit,
+    )
+
+
 def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
+    from ..flow_graph import build_edge_preview, build_node_preview
+
     ep = graph.entrypoint
+    nodes_by_id = {n.node_id: n for n in graph.nodes}
     return FlowGraphOut(
         system_id=system_id,
         snapshot_id=graph.snapshot_id,
@@ -1882,11 +1923,16 @@ def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
                 evaluation_pass=n.evaluation_pass,
                 evaluation_fail=n.evaluation_fail,
                 observed=n.observed,
+                preview=(
+                    None if n.is_external
+                    else _preview_out(build_node_preview(n))
+                ),
             )
             for n in graph.nodes
         ],
         edges=[
             FlowEdgeOut(
+                edge_id=e.edge_id,
                 source_node_id=e.source_node_id,
                 target_node_id=e.target_node_id,
                 edge_type=e.edge_type,
@@ -1895,6 +1941,11 @@ def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
                 callee_name=e.callee_name,
                 line=e.line,
                 evidence=_evidence_refs_out(e.evidence),
+                preview=_preview_out(build_edge_preview(
+                    e,
+                    nodes_by_id.get(e.source_node_id),
+                    nodes_by_id.get(e.target_node_id) if e.target_node_id else None,
+                )),
             )
             for e in graph.edges
         ],
@@ -1977,7 +2028,9 @@ def build_flow_graph_endpoint(
 ) -> FlowGraphOut:
     from ..flow_graph import build_flow_graph
 
-    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2017,10 +2070,15 @@ def create_probe_plan_from_flow(
     This is an explicit, user-driven selection (decision_method=manual). It
     only records a draft; it does not generate, apply, or run any patch.
     """
-    from ..flow_graph import build_flow_graph
-    from ..probe_planner import check_denylist
+    from ..flow_graph import (
+        build_edge_preview,
+        build_flow_graph,
+        build_node_preview,
+    )
 
-    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
     graph = build_flow_graph(
         symbols=symbols,
         files=files,
@@ -2038,24 +2096,65 @@ def create_probe_plan_from_flow(
         )
 
     nodes_by_id = {n.node_id: n for n in graph.nodes}
-    selected = []
+    edges_by_id = {e.edge_id: e for e in graph.edges}
+
+    # Resolve each selection to (the in-repo symbol node to instrument, a probe
+    # reason, and a deterministic preview). Edge/boundary selections always map
+    # to the in-repo caller; external nodes are never instrumented directly.
+    resolved_selections = []
     for sel in payload.selections:
-        node = nodes_by_id.get(sel.node_id)
-        if node is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Selected node is not part of this flow graph: {sel.node_id}",
+        if sel.target_type == "edge":
+            edge = edges_by_id.get(sel.edge_id)
+            if edge is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected edge is not part of this flow graph: {sel.edge_id}",
+                )
+            caller = nodes_by_id.get(edge.source_node_id)
+            if caller is None or caller.is_external:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Edge source is not an instrumentable node: {sel.edge_id}",
+                )
+            target = (
+                nodes_by_id.get(edge.target_node_id)
+                if edge.target_node_id else None
             )
-        if node.is_external:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "External boundary nodes cannot be instrumented directly. "
-                    "Select the in-repo caller and observe its call boundary instead: "
-                    f"{sel.node_id}"
-                ),
+            preview = build_edge_preview(edge, caller, target)
+            callee = target.qualified_name if target else edge.callee_name
+            reason = (
+                f"User-selected call boundary in flow '{graph.entrypoint.label}': "
+                f"observe before/after {edge.callee_name}() "
+                f"({edge.edge_type}) at {caller.path}:{edge.line}. Target: {callee}."
             )
-        selected.append((sel, node))
+            resolved_selections.append((sel, caller, "boundary", reason, preview))
+        else:
+            node = nodes_by_id.get(sel.node_id)
+            if node is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected node is not part of this flow graph: {sel.node_id}",
+                )
+            if node.is_external:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "External boundary nodes cannot be instrumented directly. "
+                        "Select the in-repo caller and observe its call boundary instead: "
+                        f"{sel.node_id}"
+                    ),
+                )
+            preview = build_node_preview(node)
+            observation = {
+                "input": "function input",
+                "output": "function output / return / error",
+                "boundary": "call boundary (before/after)",
+            }[sel.observation]
+            reason = (
+                f"User-selected from execution flow '{graph.entrypoint.label}'. "
+                f"Observe {observation}."
+            )
+            resolved_selections.append((sel, node, sel.observation, reason, preview))
 
     snapshot_id = snapshot_row["id"]
     now = time.time()
@@ -2088,23 +2187,12 @@ def create_probe_plan_from_flow(
             )
             plan_id = cur.lastrowid
 
-            for sel, node in selected:
-                denylist_hit = check_denylist(node.qualified_name)
-                risk = "high" if denylist_hit else node.risk
-                observation = {
-                    "input": "function input",
-                    "output": "function output / return / error",
-                    "boundary": "call boundary (before/after)",
-                }[sel.observation]
-                reason = (
-                    f"User-selected from execution flow '{graph.entrypoint.label}'. "
-                    f"Observe {observation}."
-                )
-                replayability = (
-                    "Review before shadow; selected from static flow only."
-                    if risk != "low"
-                    else "Read-oriented node selected for tracing."
-                )
+            for sel, node, _obs, reason, preview in resolved_selections:
+                # The preview carries the deterministic risk/replayability/
+                # denylist assessment for the instrumented (in-repo) symbol or
+                # its observed boundary.
+                denylist_hit = preview.denylist_hit
+                risk = preview.side_effect_risk
                 conn.execute(
                     """INSERT INTO probe_points
                            (plan_id, system_id, component_id, feature_id,
@@ -2117,7 +2205,7 @@ def create_probe_plan_from_flow(
                         node.component_id or _component_id_for(node.qualified_name),
                         feature_id, node.path, node.qualified_name,
                         node.line_start, node.line_end, reason,
-                        sel.mode_preference, risk, replayability,
+                        sel.mode_preference, risk, preview.replayability,
                         denylist_hit, now, now,
                     ),
                 )

@@ -13,12 +13,23 @@ const mockApi = {
 };
 let mockSystemId: number | null = 1;
 
+class ApiError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, detail: string) {
+    super(detail);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 vi.mock("@/api/client", () => ({
   api: mockApi,
   getSystemId: () => mockSystemId,
   setSystemId: (id: number | null) => { mockSystemId = id; },
   getSessionToken: () => "fake-token",
   setSessionToken: vi.fn(),
+  ApiError,
 }));
 
 vi.mock("@/api/auth", () => ({
@@ -435,6 +446,11 @@ describe("Flow Explorer page", () => {
         risk: "low", denylist_hit: null, evidence: [],
         boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
         evaluation_pass: 0, evaluation_fail: 0, observed: false,
+        preview: {
+          recommended_mode: "trace", captured_data: ["return value"], redaction: ["truncated"],
+          replayability: "safe", estimated_event_volume: "unknown", side_effect_risk: "low",
+          denylist_hit: null,
+        },
       },
       {
         node_id: "app.py::parse_blocks", node_type: "function", symbol_id: 2,
@@ -443,13 +459,24 @@ describe("Flow Explorer page", () => {
         risk: "low", denylist_hit: null, evidence: [],
         boundary_kind: null, is_external: false, trace_count: 0, error_count: 0,
         evaluation_pass: 0, evaluation_fail: 0, observed: false,
+        preview: {
+          recommended_mode: "trace", captured_data: ["return value"], redaction: ["truncated"],
+          replayability: "safe", estimated_event_volume: "unknown", side_effect_risk: "low",
+          denylist_hit: null,
+        },
       },
     ],
     edges: [
       {
+        edge_id: "edge::app.py::analyze_document::app.py::parse_blocks::call::7",
         source_node_id: "app.py::analyze_document", target_node_id: "app.py::parse_blocks",
         edge_type: "call", confidence: 1.0, resolution: "resolved", callee_name: "parse_blocks",
         line: 7, evidence: [],
+        preview: {
+          recommended_mode: "trace", captured_data: ["arguments before parse_blocks()"],
+          redaction: ["truncated"], replayability: "caution", estimated_event_volume: "unknown",
+          side_effect_risk: "low", denylist_hit: null,
+        },
       },
     ],
     candidate_paths: [
@@ -513,8 +540,13 @@ describe("Flow Explorer page", () => {
         expect.objectContaining({
           entrypoint_type: "http_route",
           entrypoint_id: "POST:/documents/analyze",
+          snapshot_id: 5,
+          commit_sha: "abcdef1234567890",
           selections: [
-            { node_id: "app.py::parse_blocks", observation: "output", mode_preference: "trace" },
+            {
+              target_type: "node", node_id: "app.py::parse_blocks",
+              observation: "output", mode_preference: "trace",
+            },
           ],
         }),
       );
@@ -532,12 +564,19 @@ describe("Flow Explorer page", () => {
           component_id: null, probe_capabilities: ["boundary"], risk: "medium",
           denylist_hit: null, evidence: [], boundary_kind: "database", is_external: true,
           trace_count: 0, error_count: 0, evaluation_pass: 0, evaluation_fail: 0, observed: false,
+          preview: null,
         },
       ],
       edges: [{
+        edge_id: "edge::app.py::analyze_document::external::database::cursor::database::8",
         source_node_id: "app.py::analyze_document", target_node_id: "external::database::cursor",
         edge_type: "database", confidence: 0.5, resolution: "inferred", callee_name: "execute",
         line: 8, evidence: [],
+        preview: {
+          recommended_mode: "trace", captured_data: ["arguments before execute()"],
+          redaction: ["truncated"], replayability: "caution", estimated_event_volume: "unknown",
+          side_effect_risk: "medium", denylist_hit: null,
+        },
       }],
       candidate_paths: [{
         flow_id: "flow-1", title: "analyze_document → cursor.execute", summary: "",
@@ -579,6 +618,63 @@ describe("Flow Explorer page", () => {
       "/repository/probe-plans/from-flow",
       expect.anything(),
     );
+
+    // Selecting the call-boundary EDGE instead targets the in-repo caller and
+    // pins snapshot/commit.
+    const edgeBtn = screen.getByText("database/inferred").closest("button");
+    fireEvent.click(edgeBtn!);
+    const createBtn = screen.getByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+    await waitFor(() => {
+      expect(mockApi.post).toHaveBeenCalledWith(
+        "/repository/probe-plans/from-flow",
+        expect.objectContaining({
+          snapshot_id: 5,
+          commit_sha: "abcdef1234567890",
+          selections: [
+            {
+              target_type: "edge",
+              edge_id: "edge::app.py::analyze_document::external::database::cursor::database::8",
+              observation: "boundary", mode_preference: "trace",
+            },
+          ],
+        }),
+      );
+    });
+  });
+
+  test("detects a stale-graph 409 and prompts a reload", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, commit_sha: "abcdef1234567890",
+          entrypoints: [flowGraph.entrypoint],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) => {
+      if (path === "/repository/flow-graphs") return Promise.resolve(flowGraph);
+      if (path === "/repository/probe-plans/from-flow") {
+        return Promise.reject(new ApiError(409, "Flow graph is stale"));
+      }
+      return Promise.resolve(null);
+    });
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("/documents/analyze"));
+    const matches = await screen.findAllByText("parse_blocks");
+    fireEvent.click(matches.find(el => el.className.includes("font-medium"))!);
+    const createBtn = await screen.findByText("Create Probe Plan draft");
+    await waitFor(() => expect(createBtn).not.toBeDisabled());
+    fireEvent.click(createBtn);
+
+    // The stale banner appears and offers a reload.
+    expect(await screen.findByText("Reload graph")).toBeInTheDocument();
+    expect(screen.getByText("Create Probe Plan draft")).toBeDisabled();
   });
 });
 

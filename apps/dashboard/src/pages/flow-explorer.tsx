@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import {
   useFlowEntrypoints, useBuildFlowGraph, useCreatePlanFromFlow,
 } from "@/api/hooks";
+import { ApiError } from "@/api/client";
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -12,9 +13,10 @@ import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity } from "lucide-react";
+import { Workflow, Crosshair, AlertTriangle, ArrowRight, Activity, RefreshCw } from "lucide-react";
 import type {
-  FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowProbeSelection,
+  FlowEntrypointOut, FlowGraphOut, FlowNodeOut, FlowEdgeOut,
+  FlowProbeSelection, ProbePreviewOut,
 } from "@/api/types";
 
 const RISK_VARIANT: Record<string, "secondary" | "destructive"> = {
@@ -33,6 +35,41 @@ const BOUNDARY_LABEL: Record<string, string> = {
   http: "HTTP", database: "DB", filesystem: "FS", dispatch: "async",
 };
 
+const nodeKey = (id: string) => `node:${id}`;
+const edgeKey = (id: string) => `edge:${id}`;
+
+function PreviewBlock({ preview }: { preview: ProbePreviewOut }) {
+  return (
+    <div className="space-y-1 text-[11px]">
+      <div>
+        <span className="text-muted-foreground">Recommended mode: </span>
+        <Badge variant="outline" className="text-[10px]">{preview.recommended_mode}</Badge>
+        <span className="ml-2 text-muted-foreground">Risk: </span>
+        <Badge variant={RISK_VARIANT[preview.side_effect_risk]} className="text-[10px]">
+          {preview.side_effect_risk}
+        </Badge>
+      </div>
+      <div>
+        <span className="text-muted-foreground">Captured data:</span>
+        <ul className="list-disc pl-4">
+          {preview.captured_data.map((c, i) => <li key={i}>{c}</li>)}
+        </ul>
+      </div>
+      <div>
+        <span className="text-muted-foreground">Redaction:</span>
+        <ul className="list-disc pl-4">
+          {preview.redaction.map((c, i) => <li key={i}>{c}</li>)}
+        </ul>
+      </div>
+      <div><span className="text-muted-foreground">Replayability: </span>{preview.replayability}</div>
+      <div><span className="text-muted-foreground">Estimated event volume: </span>{preview.estimated_event_volume}</div>
+      {preview.denylist_hit && (
+        <div className="text-red-600">⚠ Denylist: {preview.denylist_hit}</div>
+      )}
+    </div>
+  );
+}
+
 export default function FlowExplorerPage() {
   const { data: entrypointsData, isLoading } = useFlowEntrypoints();
   const buildGraph = useBuildFlowGraph();
@@ -44,6 +81,7 @@ export default function FlowExplorerPage() {
   const [selections, setSelections] = useState<Record<string, FlowProbeSelection>>({});
   const [objective, setObjective] = useState("");
   const [filter, setFilter] = useState("");
+  const [stale, setStale] = useState(false);
 
   const entrypoints = entrypointsData?.entrypoints ?? [];
   const filtered = entrypoints.filter(e =>
@@ -57,6 +95,7 @@ export default function FlowExplorerPage() {
     setGraph(null);
     setActiveFlowId(null);
     setSelections({});
+    setStale(false);
     try {
       const g = await buildGraph.mutateAsync({
         entrypoint_type: ep.entrypoint_type,
@@ -71,30 +110,54 @@ export default function FlowExplorerPage() {
 
   const toggleNode = (node: FlowNodeOut) => {
     if (node.is_external) {
-      toast.error("External boundary nodes can't be instrumented. Select the in-repo caller and observe its call boundary.");
+      toast.error("External boundary nodes can't be instrumented. Select the call boundary edge instead.");
       return;
     }
+    const key = nodeKey(node.node_id);
     setSelections(prev => {
       const next = { ...prev };
-      if (next[node.node_id]) {
-        delete next[node.node_id];
+      if (next[key]) {
+        delete next[key];
       } else {
-        next[node.node_id] = {
+        next[key] = {
+          target_type: "node",
           node_id: node.node_id,
           observation: "output",
-          mode_preference: node.risk === "high" ? "off" : "trace",
+          mode_preference: (node.preview?.recommended_mode as FlowProbeSelection["mode_preference"]) ?? "trace",
         };
       }
       return next;
     });
   };
 
-  const updateSelection = (nodeId: string, patch: Partial<FlowProbeSelection>) => {
-    setSelections(prev => ({ ...prev, [nodeId]: { ...prev[nodeId], ...patch } }));
+  const toggleEdge = (edge: FlowEdgeOut) => {
+    if (edge.resolution === "unresolved") {
+      toast.error("Unresolved dynamic calls can't be observed as a boundary.");
+      return;
+    }
+    const key = edgeKey(edge.edge_id);
+    setSelections(prev => {
+      const next = { ...prev };
+      if (next[key]) {
+        delete next[key];
+      } else {
+        next[key] = {
+          target_type: "edge",
+          edge_id: edge.edge_id,
+          observation: "boundary",
+          mode_preference: (edge.preview?.recommended_mode as FlowProbeSelection["mode_preference"]) ?? "trace",
+        };
+      }
+      return next;
+    });
+  };
+
+  const updateSelection = (key: string, patch: Partial<FlowProbeSelection>) => {
+    setSelections(prev => ({ ...prev, [key]: { ...prev[key], ...patch } }));
   };
 
   const submitPlan = async () => {
-    if (!activeEntrypoint) return;
+    if (!activeEntrypoint || !graph) return;
     const list = Object.values(selections);
     if (!list.length) return;
     try {
@@ -103,18 +166,26 @@ export default function FlowExplorerPage() {
         entrypoint_id: activeEntrypoint.entrypoint_id,
         objective: objective.trim() || undefined,
         selections: list,
+        snapshot_id: graph.snapshot_id,
+        commit_sha: graph.commit_sha,
       });
       toast.success(`Probe Plan draft #${plan.id} created from flow selection`);
       setSelections({});
       setObjective("");
     } catch (e) {
-      toast.error(String(e));
+      if (e instanceof ApiError && e.status === 409) {
+        setStale(true);
+        toast.error("This flow graph is out of date. Reload it and re-select.");
+      } else {
+        toast.error(String(e));
+      }
     }
   };
 
   const activeFlow = graph?.candidate_paths.find(f => f.flow_id === activeFlowId) ?? null;
   const activeNodeIds = new Set(activeFlow?.node_ids ?? graph?.nodes.map(n => n.node_id) ?? []);
   const nodesById = new Map((graph?.nodes ?? []).map(n => [n.node_id, n]));
+  const edgesById = new Map((graph?.edges ?? []).map(e => [e.edge_id, e]));
   const outgoing = (nodeId: string) =>
     (graph?.edges ?? []).filter(e => e.source_node_id === nodeId);
   const selectionCount = Object.keys(selections).length;
@@ -128,13 +199,22 @@ export default function FlowExplorerPage() {
           </h1>
           <p className="text-sm text-muted-foreground mt-1">
             Explore deterministic execution flows from an entrypoint and turn
-            selected nodes into a Probe Plan draft. Selection never generates,
-            applies, or runs a patch.
+            selected nodes or call boundaries into a Probe Plan draft. Selection
+            never generates, applies, or runs a patch.
           </p>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr_320px] gap-4">
+      {stale && activeEntrypoint && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/20 dark:border-amber-800 px-4 py-3 text-sm text-amber-900 dark:text-amber-100 flex items-center justify-between">
+          <span>This flow graph was built from an older snapshot and is now stale.</span>
+          <Button size="sm" variant="outline" onClick={() => openEntrypoint(activeEntrypoint)}>
+            <RefreshCw className="h-4 w-4 mr-1" /> Reload graph
+          </Button>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-[260px_1fr_340px] gap-4">
         {/* Left: entrypoints + candidate flows */}
         <div className="space-y-4">
           <Card>
@@ -251,10 +331,14 @@ export default function FlowExplorerPage() {
                     Graph truncated by the node budget; some branches are omitted.
                   </div>
                 )}
+                <p className="text-[11px] text-muted-foreground">
+                  Click a node to instrument it, or click an edge to observe its
+                  call boundary (before/after).
+                </p>
                 {graph.nodes
                   .filter(n => activeNodeIds.has(n.node_id))
                   .map(node => {
-                    const selected = !!selections[node.node_id];
+                    const selected = !!selections[nodeKey(node.node_id)];
                     const edges = outgoing(node.node_id)
                       .filter(e => activeNodeIds.has(e.target_node_id ?? "") || e.resolution === "unresolved");
                     return (
@@ -310,22 +394,31 @@ export default function FlowExplorerPage() {
                             <div className="text-xs text-red-600 mt-0.5">⚠ {node.denylist_hit}</div>
                           )}
                         </button>
-                        {edges.map((e, i) => (
-                          <div
-                            key={i}
-                            className="flex items-center gap-1 pl-6 text-[11px] text-muted-foreground"
-                          >
-                            <ArrowRight className="h-3 w-3" />
-                            <span className={`rounded border px-1 ${RESOLUTION_STYLE[e.resolution]}`}>
-                              {e.edge_type}/{e.resolution}
-                            </span>
-                            <span className="font-mono">
-                              {e.target_node_id
-                                ? nodesById.get(e.target_node_id)?.qualified_name ?? e.callee_name
-                                : `${e.callee_name}() (unresolved)`}
-                            </span>
-                          </div>
-                        ))}
+                        {edges.map(e => {
+                          const edgeSelected = !!selections[edgeKey(e.edge_id)];
+                          const selectable = e.resolution !== "unresolved";
+                          return (
+                            <button
+                              key={e.edge_id}
+                              onClick={() => toggleEdge(e)}
+                              disabled={!selectable}
+                              className={`flex items-center gap-1 ml-6 px-1 py-0.5 rounded text-[11px] text-muted-foreground transition-colors ${
+                                edgeSelected ? "bg-secondary/60 ring-1 ring-primary" : selectable ? "hover:bg-secondary/40" : "cursor-default"
+                              }`}
+                            >
+                              <ArrowRight className="h-3 w-3" />
+                              <span className={`rounded border px-1 ${RESOLUTION_STYLE[e.resolution]}`}>
+                                {e.edge_type}/{e.resolution}
+                              </span>
+                              <span className="font-mono">
+                                {e.target_node_id
+                                  ? nodesById.get(e.target_node_id)?.qualified_name ?? e.callee_name
+                                  : `${e.callee_name}() (unresolved)`}
+                              </span>
+                              {edgeSelected && <span className="text-primary">· boundary selected</span>}
+                            </button>
+                          );
+                        })}
                       </div>
                     );
                   })}
@@ -342,45 +435,52 @@ export default function FlowExplorerPage() {
                 <Crosshair className="h-4 w-4" /> Probe Selection
               </CardTitle>
               <CardDescription className="text-xs">
-                {selectionCount} node(s) selected
+                {selectionCount} target(s) selected
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
               {selectionCount === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  Click a node in the graph to mark it for observation.
+                  Click a node or an edge in the graph to preview and select it.
                 </p>
               ) : (
-                Object.values(selections).map(sel => {
-                  const node = nodesById.get(sel.node_id);
+                Object.entries(selections).map(([key, sel]) => {
+                  const isEdge = sel.target_type === "edge";
+                  const node = isEdge ? undefined : nodesById.get(sel.node_id ?? "");
+                  const edge = isEdge ? edgesById.get(sel.edge_id ?? "") : undefined;
+                  const caller = edge ? nodesById.get(edge.source_node_id) : undefined;
+                  const preview = isEdge ? edge?.preview : node?.preview;
+                  const title = isEdge
+                    ? `${caller?.qualified_name ?? "?"} → ${edge?.callee_name}() boundary`
+                    : node?.qualified_name ?? sel.node_id;
                   return (
-                    <div key={sel.node_id} className="rounded-md border p-2 space-y-2">
-                      <div className="font-mono text-xs font-medium truncate">
-                        {node?.qualified_name ?? sel.node_id}
+                    <div key={key} className="rounded-md border p-2 space-y-2">
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-mono text-xs font-medium truncate">{title}</span>
+                        <Badge variant="outline" className="text-[10px] shrink-0">
+                          {isEdge ? "edge" : "node"}
+                        </Badge>
                       </div>
-                      {node?.risk === "high" && (
-                        <div className="text-[11px] text-red-600">
-                          High side-effect risk · review before shadow.
-                        </div>
-                      )}
                       <div className="grid grid-cols-2 gap-2">
-                        <div>
-                          <Label className="text-[10px]">Observe</Label>
-                          <Select
-                            value={sel.observation}
-                            onChange={e => updateSelection(sel.node_id, { observation: e.target.value as FlowProbeSelection["observation"] })}
-                            className="h-7 text-xs"
-                          >
-                            <option value="input">Input</option>
-                            <option value="output">Output / error</option>
-                            <option value="boundary">Call boundary</option>
-                          </Select>
-                        </div>
+                        {!isEdge && (
+                          <div>
+                            <Label className="text-[10px]">Observe</Label>
+                            <Select
+                              value={sel.observation}
+                              onChange={e => updateSelection(key, { observation: e.target.value as FlowProbeSelection["observation"] })}
+                              className="h-7 text-xs"
+                            >
+                              <option value="input">Input</option>
+                              <option value="output">Output / error</option>
+                              <option value="boundary">Call boundary</option>
+                            </Select>
+                          </div>
+                        )}
                         <div>
                           <Label className="text-[10px]">Mode</Label>
                           <Select
                             value={sel.mode_preference}
-                            onChange={e => updateSelection(sel.node_id, { mode_preference: e.target.value as FlowProbeSelection["mode_preference"] })}
+                            onChange={e => updateSelection(key, { mode_preference: e.target.value as FlowProbeSelection["mode_preference"] })}
                             className="h-7 text-xs"
                           >
                             <option value="trace">trace</option>
@@ -389,16 +489,14 @@ export default function FlowExplorerPage() {
                           </Select>
                         </div>
                       </div>
-                      <div className="text-[10px] text-muted-foreground">
-                        Captures: {node?.probe_capabilities.join(", ")}
-                      </div>
+                      {preview && <PreviewBlock preview={preview} />}
                     </div>
                   );
                 })
               )}
               {selectionCount >= 2 && (
                 <div className="rounded-md border border-sky-200 bg-sky-50 dark:bg-sky-950/20 dark:border-sky-800 px-2 py-1.5 text-[11px] text-sky-800 dark:text-sky-200">
-                  Multiple nodes selected — trace these together to compare a
+                  Multiple targets selected — trace these together to compare a
                   latency breakdown or transformation across the flow.
                 </div>
               )}
@@ -415,7 +513,7 @@ export default function FlowExplorerPage() {
               <Button
                 className="w-full"
                 size="sm"
-                disabled={selectionCount === 0 || createPlan.isPending}
+                disabled={selectionCount === 0 || createPlan.isPending || stale}
                 onClick={submitPlan}
               >
                 {createPlan.isPending ? "Creating…" : "Create Probe Plan draft"}
