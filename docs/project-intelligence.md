@@ -293,6 +293,53 @@ backend entrypoint が薄い repository では function の素のリストが事
   backend entrypoint が 0 件のときは diagnostics をそのまま表示し、function の
   一覧を黒幕的な代替表示として出さない。
 
+### LLM 支援によるフレームワーク非依存の API 検出（Scan API definitions）
+
+決定的 AST 検出は FastAPI/Starlette/Flask しか認識しないため、Django/DRF・
+Express/NestJS・Go・Rails 等を使う repository では route が 0 件になる。これを
+補うため、Repository ページに **「Scan API definitions」** を追加する。reasoning
+model が snapshot を見て「どこに API 定義があるか」を判断し、**API 定義を抽出する
+正規表現**を生成する。正規表現は pinned snapshot に対して決定的に適用され、
+具体的な entrypoint（method/path/file/line）を抽出する。
+
+CLAUDE.md 原則 6 / reasoning-llm skill に従う:
+
+- 開放的な判断（どのファイルが API を定義し、どの正規表現が一致するか）は LLM が
+  行い、**正規表現は決定的なフィルター**として適用する。
+- mock / 非 reasoning model は **fail closed**（heuristic fallback なし）。
+- 生成された正規表現は **レビュー可能な成果物**として永続化し、決定的 AST の事実
+  とは `source` で分離する。
+
+実装:
+
+- **`app/api_scan.py`（新規）**: `build_snapshot_digest`（file inventory + API を
+  定義しそうなファイルの先頭サンプルを文字数上限付きで送る決定的な digest）、
+  `generate_api_scan`（reasoning model 呼び出し・mock fail closed）、
+  `parse_scan_response`（構造化出力の厳密検証: 正規表現の compile・長さ上限・
+  named group 整合・glob は repository 相対・ReDoS シグネチャ拒否）、
+  `apply_patterns`（**ReDoS 安全**: 行単位・行長上限付きで matching し、最悪
+  backtracking を 1 行に限定。`(?P<path>…)` を route path、`(?P<method>…)` /
+  `method_constant` を HTTP method として抽出）。
+- **永続化（system-scoped・追加のみ）**: `code_entrypoint_patterns`（生成された
+  正規表現と framework/language/reason/confidence/match_count/examples）、および
+  `code_entrypoints` に `source`（`deterministic` / `reasoning_llm`）と
+  `pattern_id` 列を追加（既存 DB には `ALTER TABLE` で後方互換マイグレーション）。
+- **API**: `POST /repository/api-scan`（`intelligence_runs(run_type='api_scan',
+  decision_method='reasoning_llm')` を記録し、pattern と抽出 entrypoint を 1
+  トランザクションで保存。再スキャンは当該 snapshot の `reasoning_llm` 行のみを
+  置換し、決定的行には触れない）、`GET /repository/api-scan`（最新スキャン取得）。
+  `GET /repository/flow-entrypoints` は永続化済みの LLM 由来 API entrypoint を
+  `api` カテゴリへマージし、`source` を返す（決定的 route と衝突する id は
+  決定的側を優先）。LLM 由来 entrypoint は handler symbol を持たないため、
+  flow graph 構築時は 422 を返し「可視化のための一覧表示のみ」と明示する。
+- **Dashboard**: Repository ページに「API Scan」タブを追加し、明示ボタンでのみ
+  実行する。生成された正規表現・framework・match 件数・抽出件数・fail closed
+  エラーを表示し、「LLM 生成のため要レビュー」と明記する。Flow Explorer では
+  LLM 由来 API entrypoint に「LLM」バッジを付ける。
+- **環境変数**: `API_SCAN_DIGEST_MAX_CHARS`（任意・既定 40000）で digest の文字数
+  上限を調整する。reasoning model の選択は既存の `INTELLIGENCE_LLM_PROVIDER` /
+  `INTELLIGENCE_LLM_MODEL`（未設定時は `LLM_PROVIDER` / `LLM_MODEL`）に従う。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

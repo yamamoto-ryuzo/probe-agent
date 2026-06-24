@@ -743,6 +743,9 @@ class FlowEntrypointOut(BaseModel):
     operation: Optional[str] = None
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     evidence: List[EvidenceRefOut] = Field(default_factory=list)
+    # "deterministic" (AST) or "reasoning_llm" (extracted via an LLM-generated
+    # regex from "Scan API definitions").
+    source: str = "deterministic"
 
 
 class EntrypointCountsOut(BaseModel):
@@ -771,6 +774,44 @@ class FlowEntrypointsOut(BaseModel):
     frameworks: List[str] = Field(default_factory=list)
     # Deterministic reasons surfaced when backend discovery is thin, so the UI
     # never silently dumps a giant raw-function list as the intended UX.
+    diagnostics: List[str] = Field(default_factory=list)
+
+
+class ApiScanRequest(BaseModel):
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+
+
+class ApiScanPatternOut(BaseModel):
+    id: Optional[int] = None
+    file_glob: str
+    regex: str
+    method_group: Optional[str] = None
+    path_group: Optional[str] = None
+    method_constant: Optional[str] = None
+    framework: str
+    language: str
+    reason: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    match_count: int = 0
+    examples: List[EvidenceRefOut] = Field(default_factory=list)
+
+
+class ApiScanResultOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    commit_sha: Optional[str] = None
+    run_id: Optional[int] = None
+    status: str = "completed"
+    decision_method: str = "reasoning_llm"
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    is_mock: bool = False
+    error: Optional[str] = None
+    # Reviewable LLM-generated regexes and the entrypoints they extracted.
+    patterns: List[ApiScanPatternOut] = Field(default_factory=list)
+    extracted_count: int = 0
+    frameworks: List[str] = Field(default_factory=list)
     diagnostics: List[str] = Field(default_factory=list)
 
 

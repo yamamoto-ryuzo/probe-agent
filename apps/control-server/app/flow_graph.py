@@ -88,6 +88,11 @@ class FlowEntrypoint:
     operation: Optional[str] = None
     confidence: float = 1.0
     evidence: List[EvidenceRef] = field(default_factory=list)
+    # Provenance of the entrypoint: "deterministic" for AST-derived rows,
+    # "reasoning_llm" for entrypoints extracted via an LLM-generated regex
+    # (Repository "Scan API definitions"). Kept so the UI and audit can keep
+    # deterministic facts separate from reasoning-model output.
+    source: str = "deterministic"
 
 
 @dataclass

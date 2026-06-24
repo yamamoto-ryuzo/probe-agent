@@ -499,22 +499,39 @@ def _framework_diagnostics(
 
 
 def discover_entrypoints(
-    symbols: List[SymbolRecord], files: List[Tuple[str, str]],
+    symbols: List[SymbolRecord],
+    files: List[Tuple[str, str]],
+    persisted_api: Optional[List[FlowEntrypoint]] = None,
 ) -> EntrypointDiscovery:
     """Discover backend entrypoints and the public-function fallback.
 
     Returns backend entrypoints (api/message_queue/scheduled_job/cli) resolved
     to handler symbols, the public-function Advanced fallback, deterministic
     diagnostics, and per-category counts.
+
+    ``persisted_api`` carries previously-saved API entrypoints that were
+    extracted from LLM-generated regexes (Repository "Scan API definitions").
+    They are merged into the ``api`` category and de-duplicated against the
+    deterministic AST routes by ``entrypoint_id``; the deterministic row wins on
+    a collision so reasoning-model output never overrides a structural fact.
     """
     api_routes, route_diags = discover_api_routes(symbols, files)
     _routes_symbolonly, message_queue, scheduled, cli, functions = (
         enumerate_symbol_entrypoints(symbols)
     )
 
-    backend = api_routes + message_queue + scheduled + cli
+    llm_api: List[FlowEntrypoint] = []
+    if persisted_api:
+        seen = {e.entrypoint_id for e in api_routes}
+        for ep in persisted_api:
+            if ep.entrypoint_id not in seen:
+                seen.add(ep.entrypoint_id)
+                llm_api.append(ep)
+
+    api = api_routes + llm_api
+    backend = api + message_queue + scheduled + cli
     counts = {
-        "api": len(api_routes),
+        "api": len(api),
         "message_queue": len(message_queue),
         "scheduled_job": len(scheduled),
         "cli": len(cli),
@@ -523,14 +540,30 @@ def discover_entrypoints(
     frameworks = sorted({e.framework for e in backend if e.framework})
 
     diagnostics: List[str] = list(route_diags)
-    diagnostics.extend(_framework_diagnostics(files, counts["api"], frameworks))
-    if counts["api"] + counts["message_queue"] + counts["scheduled_job"] + counts["cli"] == 0:
-        diagnostics.insert(
-            0,
-            "No backend entrypoints detected. Only raw functions are available "
-            "as an advanced fallback. Check repository indexing / framework "
-            "support.",
+    diagnostics.extend(_framework_diagnostics(files, len(api_routes), frameworks))
+    if llm_api:
+        diagnostics.append(
+            f"{len(llm_api)} API entrypoint(s) were recovered from LLM-generated "
+            "regex patterns (Scan API definitions). Review the patterns before "
+            "trusting them."
         )
+    if backend == []:
+        if functions:
+            diagnostics.insert(
+                0,
+                "No backend entrypoints detected. Only raw functions are "
+                "available as an advanced fallback. Run \"Scan API definitions\" "
+                "to detect APIs in unsupported frameworks/languages, or check "
+                "repository indexing.",
+            )
+        else:
+            diagnostics.insert(
+                0,
+                "No backend entrypoints and no Python functions were indexed for "
+                "this snapshot. The deterministic indexer only reads Python; run "
+                "\"Scan API definitions\" to detect APIs in other "
+                "frameworks/languages.",
+            )
 
     return EntrypointDiscovery(
         entrypoints=backend,

@@ -4,7 +4,7 @@ import type {
   SystemOut, ComponentSummary, TraceEvent, Policy,
   ShadowResult, ComponentProfile, UserOut, TokenOut,
   RepositoryCandidateOut, RepositoryConfigOut, SnapshotOut, LatestDraftsOut,
-  SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut,
+  SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
@@ -246,6 +246,25 @@ export function useIndexSymbols() {
   return useMutation({
     mutationFn: () => api.post<SymbolIndexOut>("/repository/symbols/index"),
     onSuccess: () => qc.invalidateQueries({ queryKey: sysKey("symbols") }),
+  });
+}
+
+export function useApiScanResult() {
+  return useQuery({
+    queryKey: sysKey("apiScan"),
+    queryFn: () => api.get<ApiScanResultOut>("/repository/api-scan"),
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useRunApiScan() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<ApiScanResultOut>("/repository/api-scan"),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: sysKey("apiScan") });
+      qc.invalidateQueries({ queryKey: sysKey("flowEntrypoints") });
+    },
   });
 }
 

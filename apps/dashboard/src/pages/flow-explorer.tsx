@@ -315,6 +315,11 @@ export default function FlowExplorerPage() {
                               : CATEGORY_BADGE[ep.category] ?? ep.category}
                           </Badge>
                           <span className="font-medium truncate">{primary}</span>
+                          {ep.source === "reasoning_llm" && (
+                            <Badge variant="outline" className="text-[10px] px-1 py-0 shrink-0 border-violet-400 text-violet-700 dark:text-violet-300">
+                              LLM
+                            </Badge>
+                          )}
                         </div>
                         <div className="text-muted-foreground truncate flex gap-1.5">
                           <span className="truncate">{ep.path}</span>

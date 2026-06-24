@@ -326,6 +326,39 @@ export interface FlowEntrypointOut {
   operation: string | null;
   confidence: number;
   evidence: EvidenceRefOut[];
+  source?: string;
+}
+
+export interface ApiScanPatternOut {
+  id: number | null;
+  file_glob: string;
+  regex: string;
+  method_group: string | null;
+  path_group: string | null;
+  method_constant: string | null;
+  framework: string;
+  language: string;
+  reason: string;
+  confidence: number;
+  match_count: number;
+  examples: EvidenceRefOut[];
+}
+
+export interface ApiScanResultOut {
+  system_id: number;
+  snapshot_id: number | null;
+  commit_sha: string | null;
+  run_id: number | null;
+  status: string;
+  decision_method: string;
+  provider: string | null;
+  model: string | null;
+  is_mock: boolean;
+  error: string | null;
+  patterns: ApiScanPatternOut[];
+  extracted_count: number;
+  frameworks: string[];
+  diagnostics: string[];
 }
 
 export interface EntrypointCountsOut {
