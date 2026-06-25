@@ -2665,6 +2665,18 @@ def create_probe_plan_from_flow(
                     status_code=400,
                     detail=f"Selected edge is not part of this flow graph: {sel.edge_id}",
                 )
+            # Unresolved dynamic calls are not a confirmed boundary on the graph
+            # and must not be turned into a Probe Point. The dashboard already
+            # blocks selecting them; enforce the same safety boundary in the API
+            # so it does not depend on the UI alone (issue #47).
+            if edge.resolution == "unresolved":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Unresolved edge cannot be selected as a probe boundary: "
+                        f"{sel.edge_id}"
+                    ),
+                )
             caller = nodes_by_id.get(edge.source_node_id)
             if caller is None or caller.is_external:
                 raise HTTPException(
