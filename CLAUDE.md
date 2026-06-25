@@ -13,6 +13,11 @@ The MVP focuses on Python functions and supports:
 - `off` / `trace` / `shadow` modes
 - shadow comparison between current and candidate implementations
 - manual evaluation before adoption
+- System-scoped repositories and runtime data
+- LLM-backed candidate generation and evaluation
+
+The next phases add a Feature Intelligence Layer and an isolated Experiment
+Workspace. See `docs/project-intelligence.md`.
 
 Do not implement unsafe automatic replacement in the MVP.
 
@@ -39,7 +44,33 @@ examples/
 docs/
   design.md
   mvp.md
+  project-intelligence.md
 ```
+
+---
+
+## Current Roadmap
+
+Implement Feature Intelligence in dependency order. Do not skip ahead by
+creating incomplete persistence or execution paths for later phases.
+
+1. Issue #23 — Repository Understanding MVP
+   - committed-files-only snapshot
+   - evidence-backed System Profile / Feature Map drafts
+2. Issue #24 — Feature-to-Code Mapping MVP
+   - deterministic Python AST index
+   - reasoning-model mapping from Feature to code symbols
+3. Issue #25 — Probe Plan / Temporary Patch MVP
+   - reasoning-model probe planning
+   - approved instrumentation in an isolated worktree only
+4. Issue #26 — Experiment Workspace Runner MVP
+   - baseline and source-patch variants
+   - deterministic metrics plus reasoning-model interpretation
+
+The existing `GET /project-intelligence` endpoint and the Repository,
+Feature Map, Probe Planner, and Experiments tabs are explicit mocks. Replace
+each mock only when implementing its owning issue; do not silently present
+mock data as persisted or analyzed data.
 
 ---
 
@@ -64,6 +95,39 @@ docs/
    - The MVP should target functions such as summarize, classify, normalize, extract, retrieve.
    - Avoid payment, email sending, DB writes, irreversible side effects, and authentication logic as shadow targets.
 
+5. Read target repositories from Git, not the working tree.
+   - Pin a commit SHA before analysis.
+   - Enumerate with `git ls-files` and read with `git show <sha>:<path>`.
+   - Never read untracked, ignored, or uncommitted file contents.
+   - Reject path traversal and repository-external symlink access.
+   - Do not write to the target repository.
+
+6. Limit deterministic decisions to explicit finite sets.
+   - Deterministic rules are allowed only when the result belongs to a small,
+     explicitly enumerated set or is direct structural validation.
+   - Examples: file kind, known decorator presence, status transitions, exit
+     code success/failure, schema validation, exact safety denylist matches.
+   - System understanding, Feature extraction, Feature-to-Code mapping, probe
+     selection, unknown side-effect analysis, and experiment interpretation
+     require an external reasoning-model LLM API.
+   - Keyword scores, similarity, embeddings, and static matches may retrieve
+     candidates, but must not become the final open-ended decision.
+   - If reasoning-model configuration, API calls, or structured-output
+     validation fail, fail the run. Never fall back to heuristic inference.
+
+7. Keep reasoning auditable.
+   - Persist provider, model, prompt version, schema version, decision method,
+     source snapshot, timestamps, and failure details for every intelligence run.
+   - Decision method must be one of `deterministic`, `reasoning_llm`, or `manual`.
+   - Mock LLM output is test/local-smoke data and must be visibly marked as mock.
+   - LLM recommendations never directly approve, adopt, merge, or deploy changes.
+
+8. Isolate all source changes and execution.
+   - Instrumentation and source variants run in temporary worktrees/workspaces.
+   - Commands must come from explicit repository configuration.
+   - Network is off by default; environment variables are allowlisted.
+   - Preserve reviewable patches and deterministic raw results.
+
 ---
 
 ## Required Workflow Before Code Changes
@@ -78,6 +142,15 @@ Before modifying code, always check whether the requested change requires update
 - example app
 
 If any instruction, workflow, schema rule, or recurring implementation pattern changes, update the relevant `CLAUDE.md` or `SKILL.md` first, then proceed with the implementation.
+
+For issues #23-#26, always load:
+
+- `.claude/skills/project-intelligence/SKILL.md`
+- `.claude/skills/reasoning-llm/SKILL.md` when any non-finite inference is involved
+- the area-specific skills for Control Server, Dashboard, schema, and testing
+
+Read the owning GitHub issue and `docs/project-intelligence.md` before coding.
+Treat later issues as non-goals unless the current issue explicitly expands scope.
 
 If the change affects behavior, add or update tests unless there is a clear reason not to. If tests are not added, explain why.
 
@@ -97,6 +170,12 @@ Required test coverage:
 - policy `trace` records input/output/error/duration
 - policy `shadow` returns current output while recording candidate output
 - schema changes are validated against examples
+- repository snapshots exclude uncommitted and untracked contents
+- evidence locations resolve against the pinned snapshot
+- reasoning-required operations do not use heuristic fallback
+- reasoning run metadata and failures are persisted
+- target repositories remain unchanged after worktree/experiment operations
+- deterministic raw metrics remain available when interpretation fails
 
 Do not rely only on manual testing when behavior can be covered by unit tests.
 
@@ -112,6 +191,11 @@ Do not rely only on manual testing when behavior can be covered by unit tests.
 - Do not introduce production replacement behavior unless explicitly requested in a future phase.
 - Document any new environment variables.
 - Update examples when public usage changes.
+- Do not add speculative DB tables for later roadmap phases.
+- Add persistence in the issue that owns the lifecycle and query requirements.
+- Prefer additive SQLite schema changes; include migration/backfill behavior and
+  isolation tests for every System-scoped table.
+- Keep raw deterministic facts separate from LLM interpretations in storage.
 
 ---
 

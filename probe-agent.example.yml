@@ -1,0 +1,35 @@
+repository:
+  include:
+    - README.md
+    - docs/**
+    - src/**
+    - tests/**
+  exclude:
+    - .env
+    - secrets/**
+    - data/**
+
+commands:
+  install: []
+  test:
+    - pytest
+  smoke: []
+  workload: []
+
+runtime:
+  network: false
+  timeout_seconds: 60
+  env:
+    PROBE_ENABLED: "true"
+    PROBE_DEFAULT_MODE: "trace"
+
+experiment:
+  result_artifact_path: .probe-agent/experiment-result.json
+  artifact_retention_seconds: 86400
+
+intelligence:
+  # Open-ended inference must use an external reasoning model.
+  # Deterministic rules are limited to small, explicitly enumerated finite sets.
+  provider: openai
+  reasoning_model: gpt-5.4
+  allow_heuristic_fallback: false

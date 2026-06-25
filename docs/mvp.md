@@ -91,6 +91,23 @@ MVP の境界:
 LLM 呼び出しは `app.llm` に集約し、`openai` / `anthropic` / `gemini` / `mock`
 を同じ `generate_text()` インターフェースで扱う。
 
+## Phase 6-9: Feature Intelligence / Experiment Workspace — MVP 実装済み
+
+詳細設計は [`project-intelligence.md`](project-intelligence.md) を参照。
+
+- pinned commit の tracked files だけを snapshot として読み取る
+- Feature Map、code mapping、Probe Plan、temporary instrumentation patch を永続化する
+- baseline と2件以上の source patch variants を独立 worktree で実行する
+- test / smoke / workload、trace artifact、evaluation、duration を決定的に集計する
+- source patch、raw artifact、metric comparison、採用variant、human decision note を Dashboard で確認する
+- workspace は実行後に削除し、artifact は設定した retention 期間後に cleanup する
+- 実行commandはpinned `probe-agent.yml`からのみ読み、APIから任意commandを受け取らない
+- networkは常に無効で、sandboxを確立できない場合はfail closedする
+- 有限集合への分類以外の推論は reasoning model API を必須とし、heuristic
+  fallback を禁止する
+- experiment recommendation は human decision と分離し、LLM failure 時は raw
+  metrics のみを残して `analysis_failed` とする
+
 ## やらないこと
 
 - 自動 replace

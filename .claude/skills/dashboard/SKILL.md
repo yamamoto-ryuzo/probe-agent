@@ -1,5 +1,5 @@
 ---
-description: Use when implementing or modifying the dashboard for viewing traces, policies, and shadow comparisons.
+description: Use when implementing or modifying the dashboard for systems, repository intelligence, Feature Maps, Probe Plans, experiments, traces, policies, and comparisons.
 ---
 
 # Dashboard Skill
@@ -24,6 +24,17 @@ The dashboard should support:
 - login/logout with username/password (`/auth/login`, `/auth/logout`)
 - self-service API token management (My Tokens)
 - admin-only user management tab
+- Repository tab
+- Feature Map tab
+- Probe Planner tab
+- Experiments tab
+- Decision Workspace tab (Issue #38): workspace list/create/switch, a
+  conversation thread with grounded findings/assumptions/missing information
+  visually distinguished, pinned context with links back to the owning
+  Feature Map/Components/Probe Planner/Experiments tab, and proposal
+  accept/reject with a required reason. There is no "defer" decision or
+  proposal-edit action in the API (Issue #35 only exposes accept/reject); do
+  not add UI controls for actions the API does not support.
 
 ## Authentication model
 
@@ -45,7 +56,17 @@ The dashboard should support:
 - Do not expose replace mode controls in MVP unless explicitly added later.
 - Show server/API errors clearly.
 - Never write raw tokens or passwords to logs or persistent storage.
+- Clearly distinguish `mock`, `running`, `failed`, and persisted real data.
+- Show the pinned commit and evidence path/line range for intelligence results.
+- Show decision method (`deterministic`, `reasoning_llm`, `manual`) and model
+  audit metadata where an LLM result is displayed.
+- Never display heuristic output as a fallback for reasoning-required work.
+- Separate deterministic raw metrics from LLM interpretation/recommendation.
+- LLM recommendations must not create automatic approve/adopt/apply controls.
+- Keep dangerous actions disabled until their owning backend issue is complete.
 
 ## Verification
 
 For UI-only changes, provide manual verification steps if automated tests are not available.
+Verify system switching does not leak repository, Feature, plan, or experiment
+data across Systems.

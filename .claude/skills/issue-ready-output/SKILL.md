@@ -37,3 +37,12 @@ Specify required tests or explain when manual verification is acceptable.
 ## Notes
 
 Mention risks, constraints, or follow-up tasks.
+
+For Feature Intelligence issues, also include:
+
+- dependency issue(s) and explicit non-goals from later phases
+- deterministic finite-set decisions versus reasoning-model decisions
+- no-heuristic-fallback behavior
+- required reasoning audit metadata
+- target repository and workspace safety boundaries
+- DB ownership: only tables required by this issue

@@ -1,0 +1,3212 @@
+import fnmatch
+import json
+import os
+import re
+import time
+import hashlib
+from dataclasses import replace
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+
+from ..auth import Principal, get_system_id, require_user
+from ..code_indexer import index_snapshot_files
+from ..code_mapper import (
+    FeatureContext,
+    generate_code_mapping,
+)
+from ..code_mapper import PROMPT_VERSION as MAPPING_PROMPT_VERSION
+from ..code_mapper import SCHEMA_VERSION as MAPPING_SCHEMA_VERSION
+from ..db import get_conn
+from ..draft_generator import (
+    PROMPT_VERSION,
+    SCHEMA_VERSION,
+    GenerationResult,
+    generate_drafts,
+)
+from ..git_ops import (
+    GitError,
+    create_snapshot,
+    discover_repository_candidates,
+    read_file_at_commit,
+)
+from ..llm import LLMConfig, LLMError, create_llm_client, is_reasoning_model
+from ..models import (
+    ApiScanPatternOut,
+    ApiScanRequest,
+    ApiScanResultOut,
+    CandidateFlowOut,
+    CodeSymbolOut,
+    DraftGenerationResult,
+    EntrypointCountsOut,
+    EvidenceRefOut,
+    FlowEdgeOut,
+    FlowEntrypointOut,
+    FlowEntrypointsOut,
+    FlowGraphOut,
+    FlowGraphRequest,
+    FlowNodeOut,
+    ProbePlanFromFlowRequest,
+    ProbePreviewOut,
+    FeatureCodeLinkOut,
+    FeatureCodeLinksOut,
+    FeatureDraftOut,
+    FeatureEvidence,
+    IntelligenceRunOut,
+    LatestDraftsOut,
+    LinkReviewUpdate,
+    ProbePatchApplyRequest,
+    ProbePatchOut,
+    ProbePlanOut,
+    ProbePlansListOut,
+    ProbePointOut,
+    ProbePointStatusUpdate,
+    RepositoryCandidateOut,
+    RepositoryConfigOut,
+    RepositoryConfigUpdate,
+    SnapshotFileOut,
+    SnapshotOut,
+    SymbolIndexOut,
+    SymbolIndexWarningOut,
+    SystemProfileDraftOut,
+    ValidationCommandOut,
+    ValidationRunOut,
+)
+
+router = APIRouter()
+
+
+def _probe_patch_out(conn, row) -> ProbePatchOut:
+    val_rows = conn.execute(
+        "SELECT * FROM validation_runs WHERE patch_id = ? ORDER BY id",
+        (row["id"],),
+    ).fetchall()
+    validation_runs = []
+    for vr in val_rows:
+        cmd_rows = conn.execute(
+            "SELECT * FROM validation_commands WHERE run_id = ? ORDER BY id",
+            (vr["id"],),
+        ).fetchall()
+        validation_runs.append(ValidationRunOut(
+            id=vr["id"],
+            patch_id=vr["patch_id"],
+            system_id=vr["system_id"],
+            variant=vr["variant"],
+            worktree_path=vr["worktree_path"],
+            overall_success=bool(vr["overall_success"]),
+            total_duration_ms=vr["total_duration_ms"],
+            trace_received=(
+                None if vr["trace_received"] is None
+                else bool(vr["trace_received"])
+            ),
+            trace_status=vr["trace_status"],
+            network_isolation=vr["network_isolation"],
+            cleanup_state=vr["cleanup_state"],
+            cleanup_error=vr["cleanup_error"],
+            commands=[
+                ValidationCommandOut(
+                    id=cr["id"],
+                    command=cr["command"],
+                    exit_code=cr["exit_code"],
+                    duration_ms=cr["duration_ms"],
+                    stdout=cr["stdout"],
+                    stderr=cr["stderr"],
+                    stdout_truncated=bool(cr["stdout_truncated"]),
+                    stderr_truncated=bool(cr["stderr_truncated"]),
+                    timed_out=bool(cr["timed_out"]),
+                )
+                for cr in cmd_rows
+            ],
+            error=vr["error"],
+            created_at=vr["created_at"],
+        ))
+    return ProbePatchOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        commit_sha=row["commit_sha"],
+        diff=row["diff"],
+        worktree_path=row["worktree_path"],
+        skipped=json.loads(row["skipped"]),
+        status=row["status"],
+        error=row["error"],
+        cleanup_state=row["cleanup_state"],
+        cleanup_error=row["cleanup_error"],
+        apply_status=row["apply_status"],
+        apply_error=row["apply_error"],
+        applied_at=row["applied_at"],
+        applied_by_user_id=row["applied_by_user_id"],
+        validation_runs=validation_runs,
+        created_at=row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Repository configuration
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/repository-candidates",
+    response_model=List[RepositoryCandidateOut],
+)
+def list_repository_candidates() -> List[RepositoryCandidateOut]:
+    try:
+        return [
+            RepositoryCandidateOut(name=name, path=path)
+            for name, path in discover_repository_candidates()
+        ]
+    except GitError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.get("/repository", response_model=Optional[RepositoryConfigOut])
+def get_repository_config(
+    system_id: int = Depends(get_system_id),
+) -> Optional[RepositoryConfigOut]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return RepositoryConfigOut(
+        system_id=row["system_id"],
+        repo_path=row["repo_path"],
+        include_patterns=json.loads(row["include_patterns"]),
+        exclude_patterns=json.loads(row["exclude_patterns"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@router.put("/repository", response_model=RepositoryConfigOut)
+def put_repository_config(
+    payload: RepositoryConfigUpdate,
+    system_id: int = Depends(get_system_id),
+) -> RepositoryConfigOut:
+    now = time.time()
+    include_json = json.dumps(payload.include_patterns)
+    exclude_json = json.dumps(payload.exclude_patterns)
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE repository_configs
+                SET repo_path = ?, include_patterns = ?, exclude_patterns = ?,
+                    updated_at = ?
+                WHERE system_id = ?
+                """,
+                (payload.repo_path, include_json, exclude_json, now, system_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO repository_configs
+                    (system_id, repo_path, include_patterns, exclude_patterns,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (system_id, payload.repo_path, include_json, exclude_json, now, now),
+            )
+        row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    return RepositoryConfigOut(
+        system_id=row["system_id"],
+        repo_path=row["repo_path"],
+        include_patterns=json.loads(row["include_patterns"]),
+        exclude_patterns=json.loads(row["exclude_patterns"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Snapshots
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_out(conn, snapshot_row, include_files: bool = False) -> SnapshotOut:
+    files = []
+    if include_files:
+        file_rows = conn.execute(
+            "SELECT path, source_type, size_bytes, inclusion_status, exclusion_reason "
+            "FROM snapshot_files WHERE snapshot_id = ?",
+            (snapshot_row["id"],),
+        ).fetchall()
+        files = [
+            SnapshotFileOut(
+                path=fr["path"],
+                source_type=fr["source_type"],
+                size_bytes=fr["size_bytes"],
+                inclusion_status=fr["inclusion_status"],
+                exclusion_reason=fr["exclusion_reason"],
+            )
+            for fr in file_rows
+        ]
+    return SnapshotOut(
+        id=snapshot_row["id"],
+        system_id=snapshot_row["system_id"],
+        repo_path=snapshot_row["repo_path"],
+        commit_sha=snapshot_row["commit_sha"],
+        status=snapshot_row["status"],
+        file_count=snapshot_row["file_count"],
+        total_size=snapshot_row["total_size"],
+        indexed_size=snapshot_row["indexed_size"],
+        metadata_only_count=snapshot_row["metadata_only_count"],
+        warnings=json.loads(snapshot_row["warnings"] or "[]"),
+        error_summary=snapshot_row["error_summary"],
+        created_at=snapshot_row["created_at"],
+        completed_at=snapshot_row["completed_at"],
+        files=files,
+    )
+
+
+@router.post("/repository/snapshots", response_model=SnapshotOut, status_code=201)
+def create_snapshot_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SnapshotOut:
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Repository is not configured. PUT /repository first.",
+        )
+
+    repo_path = config_row["repo_path"]
+    include_patterns = json.loads(config_row["include_patterns"])
+    exclude_patterns = json.loads(config_row["exclude_patterns"])
+
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO repository_snapshots
+                (system_id, repo_path, commit_sha, status, created_at)
+            VALUES (?, ?, '', 'indexing', ?)
+            """,
+            (system_id, repo_path, now),
+        )
+        snapshot_id = cur.lastrowid
+
+    try:
+        commit_sha, files = create_snapshot(
+            repo_path, include_patterns, exclude_patterns
+        )
+    except GitError as exc:
+        with get_conn() as conn:
+            conn.execute(
+                """
+                UPDATE repository_snapshots
+                SET status = 'failed', error_summary = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (str(exc), time.time(), snapshot_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM repository_snapshots WHERE id = ?", (snapshot_id,)
+            ).fetchone()
+        return _snapshot_out(conn, row)
+
+    total_size = sum(f.size_bytes for f in files)
+    indexed_size = sum(
+        f.size_bytes for f in files if f.inclusion_status == "indexed"
+    )
+    metadata_only_count = sum(
+        1 for f in files if f.inclusion_status != "indexed"
+    )
+    warnings = []
+    too_large_files = [f for f in files if f.inclusion_status == "too_large"]
+    binary_files = [f for f in files if f.inclusion_status == "binary"]
+    excluded_files = [f for f in files if f.inclusion_status == "excluded"]
+    unsupported_files = [f for f in files if f.inclusion_status == "unsupported"]
+    if too_large_files:
+        warnings.append(
+            f"{len(too_large_files)} file(s) exceeded the per-file size limit "
+            f"and were recorded without content"
+        )
+    if binary_files:
+        warnings.append(
+            f"{len(binary_files)} binary file(s) were recorded without content"
+        )
+    if excluded_files:
+        warnings.append(
+            f"{len(excluded_files)} file(s) were excluded by repository policy"
+        )
+    if unsupported_files:
+        warnings.append(
+            f"{len(unsupported_files)} symlink or unsupported Git object(s) "
+            "were recorded without content"
+        )
+    completed_at = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """
+                UPDATE repository_snapshots
+                SET commit_sha = ?, status = 'ready', file_count = ?,
+                    total_size = ?, indexed_size = ?,
+                    metadata_only_count = ?, warnings = ?,
+                    completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    commit_sha, len(files), total_size,
+                    indexed_size, metadata_only_count,
+                    json.dumps(warnings), completed_at, snapshot_id,
+                ),
+            )
+            for f in files:
+                conn.execute(
+                    """
+                    INSERT INTO snapshot_files
+                        (snapshot_id, path, source_type, size_bytes,
+                         content_hash, content, inclusion_status,
+                         exclusion_reason)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        f.path,
+                        f.source_type,
+                        f.size_bytes,
+                        f.content_hash,
+                        f.content,
+                        f.inclusion_status,
+                        f.exclusion_reason,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        return _snapshot_out(conn, row, include_files=True)
+
+
+@router.get("/repository/snapshots/latest", response_model=Optional[SnapshotOut])
+def get_latest_snapshot(
+    system_id: int = Depends(get_system_id),
+) -> Optional[SnapshotOut]:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return _snapshot_out(conn, row, include_files=True)
+
+
+@router.get("/repository/snapshots", response_model=List[SnapshotOut])
+def list_snapshots(
+    system_id: int = Depends(get_system_id),
+) -> List[SnapshotOut]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC
+            """,
+            (system_id,),
+        ).fetchall()
+        return [_snapshot_out(conn, row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Draft generation
+# ---------------------------------------------------------------------------
+
+
+def _evidence_out(conn, draft_type: str, draft_id: int) -> List[FeatureEvidence]:
+    rows = conn.execute(
+        """
+        SELECT path, start_line, end_line, summary
+        FROM draft_evidence
+        WHERE draft_type = ? AND draft_id = ?
+        """,
+        (draft_type, draft_id),
+    ).fetchall()
+    return [
+        FeatureEvidence(
+            path=r["path"],
+            start_line=r["start_line"],
+            end_line=r["end_line"],
+            summary=r["summary"],
+        )
+        for r in rows
+    ]
+
+
+def _intelligence_run_out(row) -> IntelligenceRunOut:
+    return IntelligenceRunOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        run_type=row["run_type"],
+        provider=row["provider"],
+        model=row["model"],
+        prompt_version=row["prompt_version"],
+        schema_version=row["schema_version"],
+        decision_method=row["decision_method"],
+        status=row["status"],
+        error_details=row["error_details"],
+        is_mock=bool(row["is_mock"]),
+        started_at=row["started_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _sp_draft_out(conn, row) -> SystemProfileDraftOut:
+    return SystemProfileDraftOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        snapshot_id=row["snapshot_id"],
+        name=row["name"],
+        purpose=row["purpose"],
+        target_users=json.loads(row["target_users"]),
+        stakeholder_value=row["stakeholder_value"],
+        constraints=json.loads(row["constraints"]),
+        success_criteria=json.loads(row["success_criteria"]),
+        evidence=_evidence_out(conn, "system_profile", row["id"]),
+        is_mock=bool(row["is_mock"]),
+        created_at=row["created_at"],
+    )
+
+
+def _feature_draft_out(conn, row) -> FeatureDraftOut:
+    return FeatureDraftOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        snapshot_id=row["snapshot_id"],
+        feature_id=row["feature_id"],
+        name=row["name"],
+        summary=row["summary"],
+        user_value=row["user_value"],
+        success_criteria=json.loads(row["success_criteria"]),
+        risks=json.loads(row["risks"]),
+        evidence=_evidence_out(conn, "feature", row["id"]),
+        decision_method=row["decision_method"],
+        is_mock=bool(row["is_mock"]),
+        created_at=row["created_at"],
+    )
+
+
+@router.post(
+    "/repository/drafts/generate",
+    response_model=DraftGenerationResult,
+    status_code=201,
+)
+def generate_drafts_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> DraftGenerationResult:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready. Create a successful snapshot first.",
+        )
+
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        file_rows = conn.execute(
+            """
+            SELECT path, source_type, size_bytes, content_hash, content
+            FROM snapshot_files
+            WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+            ORDER BY path
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    from ..git_ops import IndexedFile
+
+    indexed_files = []
+    for fr in file_rows:
+        content = bytes(fr["content"] or b"")
+        if len(content) != fr["size_bytes"]:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Snapshot content is unavailable or corrupt: {fr['path']}",
+            )
+        if hashlib.sha256(content).hexdigest() != (fr["content_hash"] or ""):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Snapshot content hash mismatch: {fr['path']}",
+            )
+        indexed_files.append(
+            IndexedFile(
+                path=fr["path"],
+                source_type=fr["source_type"],
+                size_bytes=fr["size_bytes"],
+                content_hash=fr["content_hash"] or "",
+                content=content,
+            )
+        )
+
+    llm_config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
+    try:
+        intelligence_timeout = float(os.getenv("INTELLIGENCE_LLM_TIMEOUT", "120"))
+    except ValueError:
+        intelligence_timeout = 120.0
+    if llm_config.provider != "mock":
+        llm_config = replace(
+            llm_config,
+            timeout=max(llm_config.timeout, intelligence_timeout),
+        )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Repository draft generation requires a configured reasoning model"
+            )
+        if not indexed_files:
+            raise LLMError("Snapshot contains no files")
+        llm_client = create_llm_client(llm_config)
+        result = generate_drafts(llm_client, llm_config, indexed_files)
+    except LLMError as exc:
+        result = GenerationResult(
+            provider=llm_config.provider,
+            model=llm_config.model,
+            is_mock=llm_config.provider == "mock",
+            system_profile=None,
+            features=[],
+            error=str(exc),
+        )
+    completed_at = time.time()
+
+    status = "completed" if result.error is None else "failed"
+    decision_method = "reasoning_llm"
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'repository_drafts', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id,
+                    snapshot_id,
+                    result.provider,
+                    result.model,
+                    PROMPT_VERSION,
+                    SCHEMA_VERSION,
+                    decision_method,
+                    status,
+                    result.error,
+                    1 if result.is_mock else 0,
+                    started_at,
+                    completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            sp_draft_out = None
+            if result.system_profile:
+                sp = result.system_profile
+                now = time.time()
+                cur = conn.execute(
+                    """
+                    INSERT INTO system_profile_drafts
+                        (system_id, intelligence_run_id, snapshot_id,
+                         name, purpose, target_users, stakeholder_value,
+                         constraints, success_criteria, is_mock, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        system_id,
+                        run_id,
+                        snapshot_id,
+                        sp.name,
+                        sp.purpose,
+                        json.dumps(sp.target_users),
+                        sp.stakeholder_value,
+                        json.dumps(sp.constraints),
+                        json.dumps(sp.success_criteria),
+                        1 if result.is_mock else 0,
+                        now,
+                    ),
+                )
+                sp_draft_id = cur.lastrowid
+                for ev in sp.evidence:
+                    conn.execute(
+                        """
+                        INSERT INTO draft_evidence
+                            (system_id, draft_type, draft_id, path,
+                             start_line, end_line, summary)
+                        VALUES (?, 'system_profile', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            system_id,
+                            sp_draft_id,
+                            ev.path,
+                            ev.start_line,
+                            ev.end_line,
+                            ev.summary,
+                        ),
+                    )
+                sp_row = conn.execute(
+                    "SELECT * FROM system_profile_drafts WHERE id = ?",
+                    (sp_draft_id,),
+                ).fetchone()
+                sp_draft_out = _sp_draft_out(conn, sp_row)
+
+            feature_drafts_out = []
+            for fd in result.features:
+                now = time.time()
+                cur = conn.execute(
+                    """
+                    INSERT INTO feature_drafts
+                        (system_id, intelligence_run_id, snapshot_id,
+                         feature_id, name, summary, user_value,
+                         success_criteria, risks, decision_method,
+                         is_mock, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        system_id,
+                        run_id,
+                        snapshot_id,
+                        fd.feature_id,
+                        fd.name,
+                        fd.summary,
+                        fd.user_value,
+                        json.dumps(fd.success_criteria),
+                        json.dumps(fd.risks),
+                        fd.decision_method,
+                        1 if result.is_mock else 0,
+                        now,
+                    ),
+                )
+                fd_id = cur.lastrowid
+                for ev in fd.evidence:
+                    conn.execute(
+                        """
+                        INSERT INTO draft_evidence
+                            (system_id, draft_type, draft_id, path,
+                             start_line, end_line, summary)
+                        VALUES (?, 'feature', ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            system_id,
+                            fd_id,
+                            ev.path,
+                            ev.start_line,
+                            ev.end_line,
+                            ev.summary,
+                        ),
+                    )
+                fd_row = conn.execute(
+                    "SELECT * FROM feature_drafts WHERE id = ?", (fd_id,)
+                ).fetchone()
+                feature_drafts_out.append(_feature_draft_out(conn, fd_row))
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return DraftGenerationResult(
+        intelligence_run=_intelligence_run_out(run_row),
+        system_profile_draft=sp_draft_out,
+        feature_drafts=feature_drafts_out,
+    )
+
+
+@router.get("/repository/drafts/latest", response_model=LatestDraftsOut)
+def get_latest_drafts(
+    system_id: int = Depends(get_system_id),
+) -> LatestDraftsOut:
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'repository_drafts'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+
+        if run_row:
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM repository_snapshots
+                WHERE system_id = ? AND id = ?
+                """,
+                (system_id, run_row["snapshot_id"]),
+            ).fetchone()
+        else:
+            snapshot_row = conn.execute(
+                """
+                SELECT * FROM repository_snapshots
+                WHERE system_id = ? AND status = 'ready'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (system_id,),
+            ).fetchone()
+
+        snapshot_out = (
+            _snapshot_out(conn, snapshot_row, include_files=True)
+            if snapshot_row
+            else None
+        )
+        run_out = None
+        sp_draft_out = None
+        feature_drafts_out = []
+
+        if run_row:
+            run_out = _intelligence_run_out(run_row)
+            if run_row["status"] == "completed":
+                sp_row = conn.execute(
+                    """
+                    SELECT * FROM system_profile_drafts
+                    WHERE system_id = ? AND intelligence_run_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (system_id, run_row["id"]),
+                ).fetchone()
+                if sp_row:
+                    sp_draft_out = _sp_draft_out(conn, sp_row)
+
+                fd_rows = conn.execute(
+                    """
+                    SELECT * FROM feature_drafts
+                    WHERE system_id = ? AND intelligence_run_id = ?
+                    ORDER BY id
+                    """,
+                    (system_id, run_row["id"]),
+                ).fetchall()
+                feature_drafts_out = [
+                    _feature_draft_out(conn, row) for row in fd_rows
+                ]
+
+    return LatestDraftsOut(
+        system_id=system_id,
+        snapshot=snapshot_out,
+        intelligence_run=run_out,
+        system_profile_draft=sp_draft_out,
+        feature_drafts=feature_drafts_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Symbol indexing (deterministic AST extraction)
+# ---------------------------------------------------------------------------
+
+
+def _symbol_out(row) -> CodeSymbolOut:
+    return CodeSymbolOut(
+        id=row["id"],
+        snapshot_id=row["snapshot_id"],
+        system_id=row["system_id"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        kind=row["kind"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        decorators=json.loads(row["decorators"]),
+        imports=json.loads(row["imports"]),
+        docstring=row["docstring"],
+        is_test=bool(row["is_test"]),
+        is_pydantic_model=bool(row["is_pydantic_model"]),
+        route_path=row["route_path"],
+        route_method=row["route_method"],
+        component_id=row["component_id"],
+    )
+
+
+@router.post(
+    "/repository/symbols/index",
+    response_model=SymbolIndexOut,
+    status_code=201,
+)
+def index_symbols_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> SymbolIndexOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready. Create a successful snapshot first.",
+        )
+
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        existing = conn.execute(
+            "SELECT COUNT(*) AS cnt FROM code_symbols WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()
+        if existing["cnt"] > 0:
+            sym_rows = conn.execute(
+                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+                (snapshot_id,),
+            ).fetchall()
+            warn_rows = conn.execute(
+                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
+            run_row = conn.execute(
+                """
+                SELECT * FROM intelligence_runs
+                WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
+                ORDER BY id DESC LIMIT 1
+                """,
+                (system_id, snapshot_id),
+            ).fetchone()
+            return SymbolIndexOut(
+                snapshot_id=snapshot_id,
+                system_id=system_id,
+                symbol_count=len(sym_rows),
+                warning_count=len(warn_rows),
+                symbols=[_symbol_out(r) for r in sym_rows],
+                warnings=[
+                    SymbolIndexWarningOut(path=w["path"], message=w["message"])
+                    for w in warn_rows
+                ],
+                intelligence_run=_intelligence_run_out(run_row) if run_row else None,
+            )
+
+    with get_conn() as conn:
+        file_rows = conn.execute(
+            """
+            SELECT path, content FROM snapshot_files
+            WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+            ORDER BY path
+            """,
+            (snapshot_id,),
+        ).fetchall()
+
+    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
+    started_at = time.time()
+    result = index_snapshot_files(files)
+    completed_at = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
+                        'n/a', 'n/a', 'deterministic',
+                        'completed', 0, ?, ?)
+                """,
+                (system_id, snapshot_id, started_at, completed_at),
+            )
+            run_id = cur.lastrowid
+
+            for sym in result.symbols:
+                conn.execute(
+                    """
+                    INSERT INTO code_symbols
+                        (snapshot_id, system_id, path, qualified_name, kind,
+                         start_line, end_line, decorators, imports, docstring,
+                         is_test, is_pydantic_model, route_path, route_method,
+                         component_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot_id,
+                        system_id,
+                        sym.path,
+                        sym.qualified_name,
+                        sym.kind,
+                        sym.start_line,
+                        sym.end_line,
+                        json.dumps(sym.decorators),
+                        json.dumps(sym.imports),
+                        sym.docstring,
+                        1 if sym.is_test else 0,
+                        1 if sym.is_pydantic_model else 0,
+                        sym.route_path,
+                        sym.route_method,
+                        sym.component_id,
+                    ),
+                )
+
+            for warn in result.warnings:
+                conn.execute(
+                    """
+                    INSERT INTO symbol_index_warnings
+                        (snapshot_id, system_id, path, message)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (snapshot_id, system_id, warn.path, warn.message),
+                )
+
+            conn.execute("COMMIT")
+
+            sym_rows = conn.execute(
+                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+                (snapshot_id,),
+            ).fetchall()
+            warn_rows = conn.execute(
+                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return SymbolIndexOut(
+        snapshot_id=snapshot_id,
+        system_id=system_id,
+        symbol_count=len(sym_rows),
+        warning_count=len(warn_rows),
+        symbols=[_symbol_out(r) for r in sym_rows],
+        warnings=[
+            SymbolIndexWarningOut(path=w["path"], message=w["message"])
+            for w in warn_rows
+        ],
+        intelligence_run=_intelligence_run_out(run_row),
+    )
+
+
+@router.get("/repository/symbols", response_model=SymbolIndexOut)
+def get_symbols(
+    system_id: int = Depends(get_system_id),
+) -> SymbolIndexOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            return SymbolIndexOut(
+                snapshot_id=0,
+                system_id=system_id,
+                symbol_count=0,
+                warning_count=0,
+            )
+
+        snapshot_id = snapshot_row["id"]
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+            (snapshot_id,),
+        ).fetchall()
+        warn_rows = conn.execute(
+            "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id, snapshot_id),
+        ).fetchone()
+
+    return SymbolIndexOut(
+        snapshot_id=snapshot_id,
+        system_id=system_id,
+        symbol_count=len(sym_rows),
+        warning_count=len(warn_rows),
+        symbols=[_symbol_out(r) for r in sym_rows],
+        warnings=[
+            SymbolIndexWarningOut(path=w["path"], message=w["message"])
+            for w in warn_rows
+        ],
+        intelligence_run=_intelligence_run_out(run_row) if run_row else None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Feature-to-Code mapping (reasoning model)
+# ---------------------------------------------------------------------------
+
+
+def _link_out(conn, row) -> FeatureCodeLinkOut:
+    sym_row = conn.execute(
+        "SELECT * FROM code_symbols WHERE id = ?",
+        (row["symbol_id"],),
+    ).fetchone()
+    run_row = conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ?",
+        (row["intelligence_run_id"],),
+    ).fetchone()
+    latest_snapshot = conn.execute(
+        """
+        SELECT id FROM repository_snapshots
+        WHERE system_id = ? AND status = 'ready'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (row["system_id"],),
+    ).fetchone()
+    return FeatureCodeLinkOut(
+        id=row["id"],
+        system_id=row["system_id"],
+        snapshot_id=row["snapshot_id"],
+        intelligence_run_id=row["intelligence_run_id"],
+        feature_id=row["feature_id"],
+        symbol=_symbol_out(sym_row),
+        relation_reason=row["relation_reason"],
+        confidence=row["confidence"],
+        source=row["source"],
+        review_status=row["review_status"],
+        provider=run_row["provider"],
+        model=run_row["model"],
+        prompt_version=run_row["prompt_version"],
+        schema_version=run_row["schema_version"],
+        is_stale=(
+            latest_snapshot is None
+            or latest_snapshot["id"] != row["snapshot_id"]
+        ),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+@router.post(
+    "/repository/code-links/generate",
+    response_model=FeatureCodeLinksOut,
+    status_code=201,
+)
+def generate_code_links_endpoint(
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinksOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready.",
+        )
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    if not sym_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No symbols indexed for the latest snapshot. Run symbol indexing first.",
+        )
+
+    with get_conn() as conn:
+        draft_run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND snapshot_id = ?
+              AND run_type = 'repository_drafts' AND status = 'completed'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id, snapshot_id),
+        ).fetchone()
+        if draft_run_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No completed draft generation found. Generate drafts first.",
+            )
+
+        fd_rows = conn.execute(
+            """
+            SELECT * FROM feature_drafts
+            WHERE system_id = ? AND intelligence_run_id = ?
+            ORDER BY id
+            """,
+            (system_id, draft_run_row["id"]),
+        ).fetchall()
+
+    if not fd_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No feature drafts found. Generate drafts first.",
+        )
+
+    features = []
+    for fd in fd_rows:
+        with get_conn() as conn2:
+            evidence_rows = conn2.execute(
+                "SELECT summary FROM draft_evidence WHERE draft_type = 'feature' AND draft_id = ?",
+                (fd["id"],),
+            ).fetchall()
+
+        keywords = [fd["name"]]
+        for ev in evidence_rows:
+            keywords.extend(ev["summary"].split()[:5])
+
+        features.append(FeatureContext(
+            feature_id=fd["feature_id"],
+            name=fd["name"],
+            summary=fd["summary"],
+            user_value=fd["user_value"],
+            success_criteria=json.loads(fd["success_criteria"]),
+            risks=json.loads(fd["risks"]),
+            evidence_keywords=keywords,
+        ))
+
+    from ..code_indexer import CodeSymbol as CodeSymbolData
+
+    symbols = []
+    for sr in sym_rows:
+        symbols.append(CodeSymbolData(
+            path=sr["path"],
+            qualified_name=sr["qualified_name"],
+            kind=sr["kind"],
+            start_line=sr["start_line"],
+            end_line=sr["end_line"],
+            decorators=json.loads(sr["decorators"]),
+            imports=json.loads(sr["imports"]),
+            docstring=sr["docstring"],
+            is_test=bool(sr["is_test"]),
+            is_pydantic_model=bool(sr["is_pydantic_model"]),
+            route_path=sr["route_path"],
+            route_method=sr["route_method"],
+            component_id=sr["component_id"],
+        ))
+
+    llm_config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Feature-to-code mapping requires a configured reasoning model"
+            )
+        llm_client = create_llm_client(llm_config)
+        mapping_result = generate_code_mapping(llm_client, llm_config, features, symbols)
+    except LLMError as exc:
+        mapping_result = type("R", (), {
+            "provider": llm_config.provider,
+            "model": llm_config.model,
+            "is_mock": llm_config.provider == "mock",
+            "links": [],
+            "error": str(exc),
+        })()
+    completed_at = time.time()
+
+    status = "completed" if mapping_result.error is None else "failed"
+
+    symbol_key_to_id = {}
+    for sr in sym_rows:
+        symbol_key_to_id[(sr["path"], sr["qualified_name"])] = sr["id"]
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'feature_code_mapping', ?, ?, ?, ?, 'reasoning_llm',
+                        ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id,
+                    snapshot_id,
+                    mapping_result.provider,
+                    mapping_result.model,
+                    MAPPING_PROMPT_VERSION,
+                    MAPPING_SCHEMA_VERSION,
+                    status,
+                    mapping_result.error,
+                    1 if mapping_result.is_mock else 0,
+                    started_at,
+                    completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            now = time.time()
+            for link in mapping_result.links:
+                symbol_id = symbol_key_to_id.get(
+                    (link.symbol_path, link.symbol_qualified_name)
+                )
+                if symbol_id is None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO feature_code_links
+                        (system_id, snapshot_id, intelligence_run_id,
+                         feature_id, symbol_id, relation_reason,
+                         confidence, source, review_status,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)
+                    """,
+                    (
+                        system_id,
+                        snapshot_id,
+                        run_id,
+                        link.feature_id,
+                        symbol_id,
+                        link.relation_reason,
+                        link.confidence,
+                        link.source,
+                        now,
+                        now,
+                    ),
+                )
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+
+            link_rows = conn.execute(
+                """
+                SELECT * FROM feature_code_links
+                WHERE intelligence_run_id = ?
+                ORDER BY feature_id, confidence DESC
+                """,
+                (run_id,),
+            ).fetchall()
+
+            links_out = [_link_out(conn, lr) for lr in link_rows]
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return FeatureCodeLinksOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        intelligence_run=_intelligence_run_out(run_row),
+        links=links_out,
+        is_mock=mapping_result.is_mock,
+    )
+
+
+@router.get("/repository/code-links", response_model=FeatureCodeLinksOut)
+def get_code_links(
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinksOut:
+    with get_conn() as conn:
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'feature_code_mapping'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if run_row is None:
+            return FeatureCodeLinksOut(system_id=system_id)
+
+        link_rows = conn.execute(
+            """
+            SELECT * FROM feature_code_links
+            WHERE intelligence_run_id = ?
+            ORDER BY feature_id, confidence DESC
+            """,
+            (run_row["id"],),
+        ).fetchall()
+
+        return FeatureCodeLinksOut(
+            system_id=system_id,
+            snapshot_id=run_row["snapshot_id"],
+            intelligence_run=_intelligence_run_out(run_row),
+            links=[_link_out(conn, lr) for lr in link_rows],
+            is_mock=bool(run_row["is_mock"]),
+        )
+
+
+@router.put(
+    "/repository/code-links/{link_id}/review",
+    response_model=FeatureCodeLinkOut,
+)
+def review_code_link(
+    link_id: int,
+    payload: LinkReviewUpdate,
+    system_id: int = Depends(get_system_id),
+) -> FeatureCodeLinkOut:
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM feature_code_links WHERE id = ? AND system_id = ?",
+            (link_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Link not found")
+        conn.execute(
+            """
+            UPDATE feature_code_links
+            SET review_status = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (payload.review_status, now, link_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM feature_code_links WHERE id = ?",
+            (link_id,),
+        ).fetchone()
+        return _link_out(conn, row)
+
+
+# ---------------------------------------------------------------------------
+# Probe Plan generation (reasoning model)
+# ---------------------------------------------------------------------------
+
+
+def _probe_point_out(row) -> ProbePointOut:
+    return ProbePointOut(
+        id=row["id"],
+        plan_id=row["plan_id"],
+        system_id=row["system_id"],
+        component_id=row["component_id"],
+        feature_id=row["feature_id"],
+        path=row["path"],
+        symbol=row["symbol"],
+        line_start=row["line_start"],
+        line_end=row["line_end"],
+        reason=row["reason"],
+        recommended_mode=row["recommended_mode"],
+        side_effect_risk=row["side_effect_risk"],
+        replayability=row["replayability"],
+        denylist_hit=row["denylist_hit"],
+        status=row["status"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _probe_plan_out(conn, plan_row, include_run: bool = True) -> ProbePlanOut:
+    point_rows = conn.execute(
+        "SELECT * FROM probe_points WHERE plan_id = ? ORDER BY id",
+        (plan_row["id"],),
+    ).fetchall()
+
+    run_out = None
+    is_mock = False
+    if include_run:
+        run_row = conn.execute(
+            "SELECT * FROM intelligence_runs WHERE id = ?",
+            (plan_row["intelligence_run_id"],),
+        ).fetchone()
+        if run_row:
+            run_out = _intelligence_run_out(run_row)
+            is_mock = bool(run_row["is_mock"])
+
+    avoid_rows = conn.execute(
+        """SELECT summary FROM draft_evidence
+           WHERE draft_type = 'probe_plan_avoid' AND draft_id = ?""",
+        (plan_row["id"],),
+    ).fetchall()
+
+    return ProbePlanOut(
+        id=plan_row["id"],
+        system_id=plan_row["system_id"],
+        snapshot_id=plan_row["snapshot_id"],
+        intelligence_run_id=plan_row["intelligence_run_id"],
+        feature_id=plan_row["feature_id"],
+        objective=plan_row["objective"],
+        status=plan_row["status"],
+        avoid_reasons=[r["summary"] for r in avoid_rows],
+        probe_points=[_probe_point_out(r) for r in point_rows],
+        intelligence_run=run_out,
+        is_mock=is_mock,
+        created_at=plan_row["created_at"],
+        updated_at=plan_row["updated_at"],
+    )
+
+
+@router.post(
+    "/repository/probe-plans/generate",
+    response_model=ProbePlanOut,
+    status_code=201,
+)
+def generate_probe_plan_endpoint(
+    feature_id: str,
+    objective: str = "",
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    from ..probe_planner import AcceptedLink, generate_probe_plan
+    from ..probe_planner import PROMPT_VERSION as PLAN_PROMPT_VERSION
+    from ..probe_planner import SCHEMA_VERSION as PLAN_SCHEMA_VERSION
+
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """SELECT * FROM repository_snapshots
+               WHERE system_id = ? ORDER BY id DESC LIMIT 1""",
+            (system_id,),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(
+            status_code=400,
+            detail="Latest snapshot is not ready.",
+        )
+    snapshot_id = snapshot_row["id"]
+
+    with get_conn() as conn:
+        fd_row = conn.execute(
+            """SELECT fd.* FROM feature_drafts fd
+               JOIN intelligence_runs ir ON fd.intelligence_run_id = ir.id
+               WHERE fd.system_id = ? AND fd.feature_id = ?
+                 AND fd.snapshot_id = ?
+                 AND ir.status = 'completed'
+               ORDER BY fd.id DESC LIMIT 1""",
+            (system_id, feature_id, snapshot_id),
+        ).fetchone()
+    if fd_row is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No completed feature draft found for feature_id: {feature_id}",
+        )
+
+    with get_conn() as conn:
+        link_rows = conn.execute(
+            """SELECT fcl.*, cs.path AS sym_path, cs.qualified_name, cs.kind,
+                      cs.start_line, cs.end_line, cs.decorators, cs.component_id,
+                      cs.is_test, cs.docstring
+               FROM feature_code_links fcl
+               JOIN code_symbols cs ON fcl.symbol_id = cs.id
+               WHERE fcl.system_id = ? AND fcl.feature_id = ?
+                 AND fcl.snapshot_id = ?
+                 AND fcl.review_status = 'accepted'
+               ORDER BY fcl.confidence DESC""",
+            (system_id, feature_id, snapshot_id),
+        ).fetchall()
+    if not link_rows:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No accepted code links for feature: {feature_id}. Accept links first.",
+        )
+
+    accepted_links = []
+    for lr in link_rows:
+        accepted_links.append(AcceptedLink(
+            feature_id=lr["feature_id"],
+            symbol_qualified_name=lr["qualified_name"],
+            symbol_path=lr["sym_path"],
+            symbol_kind=lr["kind"],
+            start_line=lr["start_line"],
+            end_line=lr["end_line"],
+            decorators=json.loads(lr["decorators"]),
+            component_id=lr["component_id"],
+            is_test=bool(lr["is_test"]),
+            docstring=lr["docstring"],
+            relation_reason=lr["relation_reason"],
+        ))
+
+    llm_config = LLMConfig.from_env()
+    intelligence_provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    intelligence_model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if intelligence_provider or intelligence_model:
+        llm_config = replace(
+            llm_config,
+            provider=intelligence_provider or llm_config.provider,
+            model=intelligence_model or llm_config.model,
+        )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "Probe plan generation requires a configured reasoning model"
+            )
+        llm_client = create_llm_client(llm_config)
+        plan_result = generate_probe_plan(
+            llm_client,
+            llm_config,
+            feature_id=feature_id,
+            feature_name=fd_row["name"],
+            feature_summary=fd_row["summary"],
+            feature_user_value=fd_row["user_value"],
+            feature_success_criteria=json.loads(fd_row["success_criteria"]),
+            feature_risks=json.loads(fd_row["risks"]),
+            accepted_links=accepted_links,
+            objective_hint=objective,
+        )
+    except LLMError as exc:
+        from ..probe_planner import PlanResult
+        plan_result = PlanResult(
+            provider=llm_config.provider,
+            model=llm_config.model,
+            is_mock=llm_config.provider == "mock",
+            feature_id=feature_id,
+            objective="",
+            probe_points=[],
+            avoid_reasons=[],
+            error=str(exc),
+        )
+    completed_at = time.time()
+
+    status = "completed" if plan_result.error is None else "failed"
+    now = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, error_details, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan', ?, ?, ?, ?, 'reasoning_llm',
+                           ?, ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id,
+                    plan_result.provider, plan_result.model,
+                    PLAN_PROMPT_VERSION, PLAN_SCHEMA_VERSION,
+                    status, plan_result.error,
+                    1 if plan_result.is_mock else 0,
+                    started_at, completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            plan_status = "proposed" if plan_result.error is None else "rejected"
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id,
+                        feature_id, objective, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id, run_id,
+                    feature_id, plan_result.objective,
+                    plan_status, now, now,
+                ),
+            )
+            plan_id = cur.lastrowid
+
+            for point in plan_result.probe_points:
+                conn.execute(
+                    """INSERT INTO probe_points
+                           (plan_id, system_id, component_id, feature_id,
+                            path, symbol, line_start, line_end, reason,
+                            recommended_mode, side_effect_risk, replayability,
+                            denylist_hit, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                    (
+                        plan_id, system_id, point.component_id, point.feature_id,
+                        point.path, point.symbol, point.line_start, point.line_end,
+                        point.reason, point.recommended_mode, point.side_effect_risk,
+                        point.replayability, point.denylist_hit,
+                        now, now,
+                    ),
+                )
+
+            for avoid_reason in plan_result.avoid_reasons:
+                conn.execute(
+                    """INSERT INTO draft_evidence
+                           (system_id, draft_type, draft_id, path,
+                            start_line, end_line, summary)
+                       VALUES (?, 'probe_plan_avoid', ?, '', 0, 0, ?)""",
+                    (system_id, plan_id, avoid_reason),
+                )
+
+            plan_row = conn.execute(
+                "SELECT * FROM probe_plans WHERE id = ?", (plan_id,),
+            ).fetchone()
+            result = _probe_plan_out(conn, plan_row)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return result
+
+
+@router.get("/repository/probe-plans", response_model=ProbePlansListOut)
+def get_probe_plans(
+    system_id: int = Depends(get_system_id),
+) -> ProbePlansListOut:
+    with get_conn() as conn:
+        plan_rows = conn.execute(
+            "SELECT * FROM probe_plans WHERE system_id = ? ORDER BY id DESC",
+            (system_id,),
+        ).fetchall()
+        plans = [_probe_plan_out(conn, row) for row in plan_rows]
+        is_mock = any(p.is_mock for p in plans)
+    return ProbePlansListOut(system_id=system_id, plans=plans, is_mock=is_mock)
+
+
+@router.get("/repository/probe-plans/{plan_id}", response_model=ProbePlanOut)
+def get_probe_plan(
+    plan_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_plans WHERE id = ? AND system_id = ?",
+            (plan_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Probe plan not found")
+        return _probe_plan_out(conn, row)
+
+
+@router.put(
+    "/repository/probe-points/{point_id}/status",
+    response_model=ProbePointOut,
+)
+def update_probe_point_status(
+    point_id: int,
+    payload: ProbePointStatusUpdate,
+    system_id: int = Depends(get_system_id),
+) -> ProbePointOut:
+    now = time.time()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_points WHERE id = ? AND system_id = ?",
+            (point_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Probe point not found")
+        if payload.status == "approved" and row["denylist_hit"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Safety-denylisted probe points cannot be approved",
+            )
+        conn.execute(
+            """UPDATE probe_points SET status = ?, updated_at = ? WHERE id = ?""",
+            (payload.status, now, point_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM probe_points WHERE id = ?", (point_id,),
+        ).fetchone()
+        return _probe_point_out(row)
+
+
+# ---------------------------------------------------------------------------
+# Flow graph explorer (Issue #43, Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def _latest_ready_snapshot(conn, system_id: int):
+    return conn.execute(
+        """SELECT * FROM repository_snapshots
+           WHERE system_id = ? AND status = 'ready'
+           ORDER BY id DESC LIMIT 1""",
+        (system_id,),
+    ).fetchone()
+
+
+def _load_flow_inputs(
+    system_id: int,
+    expected_snapshot_id: Optional[int] = None,
+    expected_commit_sha: Optional[str] = None,
+):
+    """Load snapshot symbols and indexed Python sources for flow building.
+
+    Returns ``(snapshot_row, symbol_records, files)`` or raises HTTPException.
+    Only committed-snapshot content is read; no working-tree access.
+
+    When ``expected_snapshot_id`` / ``expected_commit_sha`` are supplied they
+    must match the current latest ready snapshot; otherwise the caller's graph
+    is stale (a newer snapshot exists) and a 409 is raised so the UI reloads.
+    """
+    from ..flow_graph import SymbolRecord
+
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No ready snapshot. Create a snapshot first.",
+            )
+        snapshot_id = snapshot_row["id"]
+
+        if (
+            expected_snapshot_id is not None
+            and expected_snapshot_id != snapshot_id
+        ) or (
+            expected_commit_sha is not None
+            and expected_commit_sha != snapshot_row["commit_sha"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Flow graph is stale: a newer snapshot exists "
+                    f"(requested snapshot {expected_snapshot_id}/"
+                    f"{expected_commit_sha}, current {snapshot_id}/"
+                    f"{snapshot_row['commit_sha']}). Reload the flow graph."
+                ),
+            )
+        sym_rows = conn.execute(
+            "SELECT * FROM code_symbols WHERE snapshot_id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchall()
+        file_rows = conn.execute(
+            """SELECT path, content FROM snapshot_files
+               WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+                 AND path LIKE '%.py'
+               ORDER BY path""",
+            (snapshot_id,),
+        ).fetchall()
+
+    if not sym_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No symbols indexed for the latest snapshot. Run symbol indexing first.",
+        )
+
+    symbols = [
+        SymbolRecord(
+            symbol_id=r["id"],
+            path=r["path"],
+            qualified_name=r["qualified_name"],
+            kind=r["kind"],
+            start_line=r["start_line"],
+            end_line=r["end_line"],
+            decorators=json.loads(r["decorators"]),
+            component_id=r["component_id"],
+            route_path=r["route_path"],
+            route_method=r["route_method"],
+            docstring=r["docstring"],
+            is_test=bool(r["is_test"]),
+        )
+        for r in sym_rows
+    ]
+    files = [
+        (fr["path"], bytes(fr["content"] or b"").decode("utf-8", errors="replace"))
+        for fr in file_rows
+    ]
+    return snapshot_row, symbols, files
+
+
+def _evidence_refs_out(evidence) -> List[EvidenceRefOut]:
+    return [
+        EvidenceRefOut(
+            path=e.path, start_line=e.start_line, end_line=e.end_line, summary=e.summary,
+        )
+        for e in evidence
+    ]
+
+
+def _entrypoint_out(e) -> FlowEntrypointOut:
+    return FlowEntrypointOut(
+        entrypoint_type=e.entrypoint_type,
+        entrypoint_id=e.entrypoint_id,
+        label=e.label,
+        path=e.path,
+        qualified_name=e.qualified_name,
+        line_start=e.line_start,
+        line_end=e.line_end,
+        component_id=e.component_id,
+        route_method=e.route_method,
+        route_path=e.route_path,
+        category=e.category,
+        framework=e.framework,
+        operation=e.operation,
+        confidence=e.confidence,
+        evidence=_evidence_refs_out(e.evidence),
+        source=getattr(e, "source", "deterministic"),
+    )
+
+
+def _load_persisted_api_entrypoints(system_id: int, snapshot_id: int):
+    """Load previously-saved LLM-regex API entrypoints for a snapshot.
+
+    These come from "Scan API definitions" (an ``api_scan`` reasoning run) and
+    are kept separate from deterministic AST rows by ``source='reasoning_llm'``.
+    """
+    from ..flow_graph import EvidenceRef, FlowEntrypoint
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM code_entrypoints WHERE system_id = ? AND snapshot_id = ? "
+            "AND source = 'reasoning_llm'",
+            (system_id, snapshot_id),
+        ).fetchall()
+    eps = []
+    for r in rows:
+        evidence = [
+            EvidenceRef(
+                path=ev["path"], start_line=ev["start_line"],
+                end_line=ev["end_line"], summary=ev["summary"],
+            )
+            for ev in json.loads(r["evidence_json"])
+        ]
+        eps.append(FlowEntrypoint(
+            entrypoint_type=r["entrypoint_type"],
+            entrypoint_id=r["entrypoint_id"],
+            label=r["label"],
+            path=r["handler_path"],
+            qualified_name=r["handler_qualified_name"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+            route_method=r["route_method"],
+            route_path=r["route_path"],
+            category=r["category"],
+            framework=r["framework"],
+            operation=r["operation"],
+            confidence=r["confidence"],
+            evidence=evidence,
+            source="reasoning_llm",
+        ))
+    return eps
+
+
+def _ensure_entrypoints_indexed(system_id: int, snapshot_row, symbols, files):
+    """Run deterministic entrypoint discovery and persist it once per snapshot.
+
+    Discovery itself is deterministic and recomputed on each call (it is cheap);
+    the persisted ``code_entrypoints`` rows and the ``entrypoint_index``
+    intelligence run are the audit artefacts required by the issue. Persistence
+    is idempotent: it happens only the first time for a given snapshot.
+    """
+    from ..entrypoint_discovery import DISCOVERY_VERSION, discover_entrypoints
+
+    snapshot_id = snapshot_row["id"]
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_id)
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    now = time.time()
+    with get_conn() as conn:
+        run_exists = conn.execute(
+            """SELECT 1 FROM intelligence_runs
+               WHERE system_id = ? AND snapshot_id = ?
+                 AND run_type = 'entrypoint_index' LIMIT 1""",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run_exists:
+            return discovery
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'entrypoint_index', 'deterministic', 'ast',
+                           ?, ?, 'deterministic', 'completed', 0, ?, ?)""",
+                (system_id, snapshot_id, DISCOVERY_VERSION, DISCOVERY_VERSION,
+                 now, now),
+            )
+            sym_rows = conn.execute(
+                "SELECT id, path, qualified_name FROM code_symbols "
+                "WHERE snapshot_id = ? AND system_id = ?",
+                (snapshot_id, system_id),
+            ).fetchall()
+            sym_id = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
+            for e in discovery.entrypoints:
+                # LLM-regex entrypoints are persisted by the api_scan endpoint
+                # with their own source/pattern_id; only the deterministic AST
+                # rows are owned by this entrypoint_index run.
+                if getattr(e, "source", "deterministic") != "deterministic":
+                    continue
+                evidence_json = json.dumps([
+                    {"path": ev.path, "start_line": ev.start_line,
+                     "end_line": ev.end_line, "summary": ev.summary}
+                    for ev in e.evidence
+                ])
+                conn.execute(
+                    """INSERT OR IGNORE INTO code_entrypoints
+                           (system_id, snapshot_id, entrypoint_type, entrypoint_id,
+                            category, label, operation, framework, handler_symbol_id,
+                            handler_path, handler_qualified_name, line_start, line_end,
+                            route_method, route_path, confidence, evidence_json,
+                            source, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               'deterministic', ?)""",
+                    (
+                        system_id, snapshot_id, e.entrypoint_type, e.entrypoint_id,
+                        e.category, e.label, e.operation, e.framework,
+                        sym_id.get((e.path, e.qualified_name)),
+                        e.path, e.qualified_name, e.line_start, e.line_end,
+                        e.route_method, e.route_path, e.confidence, evidence_json,
+                        now,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return discovery
+
+
+def _ep_matches(e, needle: str) -> bool:
+    return (
+        needle in e.label.lower()
+        or needle in e.path.lower()
+        or needle in (e.operation or "").lower()
+        or needle in e.qualified_name.lower()
+    )
+
+
+@router.get("/repository/flow-entrypoints", response_model=FlowEntrypointsOut)
+def list_flow_entrypoints(
+    system_id: int = Depends(get_system_id),
+    category: Optional[str] = Query(
+        default=None,
+        description="Filter backend entrypoints by category: api | message_queue "
+        "| scheduled_job | cli. 'function' returns the Advanced fallback; "
+        "'all' (or omitted) returns every backend kind.",
+    ),
+    entrypoint_type: Optional[str] = Query(
+        default=None,
+        description="Alias of 'category'; also accepts dispatch types "
+        "(http_route/public_function) for convenience.",
+    ),
+    q: Optional[str] = Query(default=None, description="Case-insensitive substring filter."),
+    include_functions: bool = Query(
+        default=False,
+        description="Include the public-function Advanced fallback in 'functions'.",
+    ),
+) -> FlowEntrypointsOut:
+    """List backend entrypoints (Issue #51, backend-entrypoint-first).
+
+    ``entrypoints`` carries only backend entrypoints (api/message_queue/
+    scheduled_job/cli) resolved to handler symbols. The public-function fallback
+    is demoted to ``functions`` and returned only when explicitly requested
+    (``include_functions`` or ``category=function``). ``counts`` and
+    ``diagnostics`` let the UI explain thin discovery instead of dumping the raw
+    function index.
+    """
+    from ..flow_graph import category_for_type
+
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            return FlowEntrypointsOut(system_id=system_id)
+    snapshot_row, symbols, files = _load_flow_inputs(system_id)
+    discovery = _ensure_entrypoints_indexed(system_id, snapshot_row, symbols, files)
+
+    backend = list(discovery.entrypoints)
+    functions = list(discovery.functions)
+
+    wanted = category or entrypoint_type
+    wanted_category = None
+    if wanted and wanted.lower() not in ("all", ""):
+        wanted_category = category_for_type(wanted.lower())
+
+    if wanted_category == "function":
+        backend = []
+    elif wanted_category is not None:
+        backend = [e for e in backend if e.category == wanted_category]
+
+    want_functions = include_functions or wanted_category == "function"
+    funcs_out = functions if want_functions else []
+
+    if q and q.strip():
+        needle = q.strip().lower()
+        backend = [e for e in backend if _ep_matches(e, needle)]
+        funcs_out = [e for e in funcs_out if _ep_matches(e, needle)]
+
+    return FlowEntrypointsOut(
+        system_id=system_id,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        total=discovery.backend_total,
+        entrypoints=[_entrypoint_out(e) for e in backend],
+        functions=[_entrypoint_out(e) for e in funcs_out],
+        counts=EntrypointCountsOut(**discovery.counts),
+        indexed_function_count=discovery.indexed_function_count,
+        has_backend_entrypoints=discovery.backend_total > 0,
+        frameworks=discovery.frameworks,
+        diagnostics=discovery.diagnostics,
+    )
+
+
+def _load_scan_files(system_id: int, expected_snapshot_id=None, expected_commit_sha=None):
+    """Load all indexed text files for the latest ready snapshot (any language).
+
+    Unlike ``_load_flow_inputs`` this is not restricted to ``.py`` and does not
+    require indexed symbols, because the LLM scan operates on raw source across
+    frameworks/languages. Only committed-snapshot content is read.
+    """
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            raise HTTPException(
+                status_code=400, detail="No ready snapshot. Create a snapshot first.",
+            )
+        snapshot_id = snapshot_row["id"]
+        if (
+            expected_snapshot_id is not None and expected_snapshot_id != snapshot_id
+        ) or (
+            expected_commit_sha is not None
+            and expected_commit_sha != snapshot_row["commit_sha"]
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Snapshot is stale: a newer snapshot exists. Reload and retry.",
+            )
+        file_rows = conn.execute(
+            """SELECT path, content FROM snapshot_files
+               WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+               ORDER BY path""",
+            (snapshot_id,),
+        ).fetchall()
+    files = [
+        (fr["path"], bytes(fr["content"] or b"").decode("utf-8", errors="replace"))
+        for fr in file_rows
+    ]
+    return snapshot_row, files
+
+
+def _resolve_intelligence_config():
+    """Return an LLMConfig with the intelligence-model override applied."""
+    llm_config = LLMConfig.from_env()
+    provider = os.getenv("INTELLIGENCE_LLM_PROVIDER", "").strip()
+    model = os.getenv("INTELLIGENCE_LLM_MODEL", "").strip()
+    if provider or model:
+        llm_config = replace(
+            llm_config,
+            provider=provider or llm_config.provider,
+            model=model or llm_config.model,
+        )
+    return llm_config
+
+
+def _snapshot_config_stale_reason(system_id: int, snapshot_row) -> Optional[str]:
+    """Return a clear reason when the latest snapshot predates repo settings.
+
+    Repository include/exclude patterns are applied only when a snapshot is
+    created. If the user adds e.g. ``backend/**`` after the latest snapshot, API
+    discovery will still inspect the old file set and silently miss routes.
+    """
+    with get_conn() as conn:
+        config_row = conn.execute(
+            "SELECT * FROM repository_configs WHERE system_id = ?", (system_id,)
+        ).fetchone()
+    if config_row is None:
+        return None
+
+    snapshot_time = snapshot_row["completed_at"] or snapshot_row["created_at"] or 0
+    if (config_row["updated_at"] or 0) <= snapshot_time:
+        return None
+
+    include_patterns = json.loads(config_row["include_patterns"] or "[]")
+    exclude_patterns = json.loads(config_row["exclude_patterns"] or "[]")
+    return (
+        "Repository settings were updated after the latest snapshot was created. "
+        "Create a new repository snapshot and re-run symbol indexing/API scan. "
+        f"Current include_patterns={include_patterns}, "
+        f"exclude_patterns={exclude_patterns}."
+    )
+
+
+def _api_scan_pattern_out(row) -> ApiScanPatternOut:
+    examples = [
+        EvidenceRefOut(path=ex.get("path", ""), start_line=int(ex.get("line", 0)),
+                       end_line=int(ex.get("line", 0)), summary="example match")
+        for ex in json.loads(row["examples_json"])
+    ]
+    return ApiScanPatternOut(
+        id=row["id"],
+        file_glob=row["file_glob"],
+        regex=row["regex"],
+        method_group=row["method_group"],
+        path_group=row["path_group"],
+        method_constant=row["method_constant"],
+        framework=row["framework"],
+        language=row["language"],
+        reason=row["reason"],
+        confidence=row["confidence"],
+        match_count=row["match_count"],
+        examples=examples,
+    )
+
+
+@router.post("/repository/api-scan", response_model=ApiScanResultOut)
+def run_api_scan(
+    payload: Optional[ApiScanRequest] = None,
+    system_id: int = Depends(get_system_id),
+) -> ApiScanResultOut:
+    """Scan the snapshot with a reasoning model to discover API definitions.
+
+    The model returns regular expressions that filter API definitions; the
+    regexes are applied deterministically to the pinned snapshot to extract
+    concrete entrypoints. Fails closed (no heuristic fallback) for mock or
+    non-reasoning models. Persists an ``api_scan`` audit run, the reviewable
+    regex patterns, and the extracted entrypoints (source='reasoning_llm').
+    """
+    from ..api_scan import (
+        PROMPT_VERSION as SCAN_PROMPT_VERSION,
+        SCHEMA_VERSION as SCAN_SCHEMA_VERSION,
+        apply_patterns,
+        build_snapshot_digest,
+        generate_api_scan,
+    )
+
+    payload = payload or ApiScanRequest()
+    snapshot_row, files = _load_scan_files(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    snapshot_id = snapshot_row["id"]
+    llm_config = _resolve_intelligence_config()
+
+    if payload.snapshot_id is None and payload.commit_sha is None:
+        stale_reason = _snapshot_config_stale_reason(system_id, snapshot_row)
+        if stale_reason:
+            return ApiScanResultOut(
+                system_id=system_id,
+                snapshot_id=snapshot_id,
+                commit_sha=snapshot_row["commit_sha"],
+                status="failed",
+                provider=llm_config.provider,
+                model=llm_config.model,
+                is_mock=llm_config.provider == "mock",
+                error=stale_reason,
+                diagnostics=[
+                    "The API scanner only reads files stored in the selected "
+                    "repository snapshot.",
+                    "Repository include/exclude changes do not modify existing "
+                    "snapshots.",
+                ],
+            )
+
+    started_at = time.time()
+    try:
+        if llm_config.provider != "mock" and not is_reasoning_model(
+            llm_config.provider, llm_config.model
+        ):
+            raise LLMError(
+                "API definition scanning requires a configured reasoning model"
+            )
+        client = create_llm_client(llm_config)
+        digest = build_snapshot_digest(files)
+        scan = generate_api_scan(client, llm_config, digest)
+    except LLMError as exc:
+        scan = type("R", (), {
+            "provider": llm_config.provider, "model": llm_config.model,
+            "is_mock": llm_config.provider == "mock", "patterns": [],
+            "error": str(exc),
+        })()
+
+    extraction_diags: List[str] = []
+    extracted = []
+    if scan.error is None:
+        extracted, extraction_diags = apply_patterns(scan.patterns, files)
+
+    status = "completed" if scan.error is None else "failed"
+    now = time.time()
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, error_details, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'api_scan', ?, ?, ?, ?, 'reasoning_llm',
+                           ?, ?, ?, ?, ?)""",
+                (
+                    system_id, snapshot_id, scan.provider, scan.model,
+                    SCAN_PROMPT_VERSION, SCAN_SCHEMA_VERSION, status,
+                    scan.error, 1 if scan.is_mock else 0, started_at, now,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            if status == "completed":
+                # Replace any prior LLM-regex discovery for this snapshot so a
+                # re-scan is authoritative; deterministic rows are untouched.
+                conn.execute(
+                    "DELETE FROM code_entrypoints WHERE system_id = ? "
+                    "AND snapshot_id = ? AND source = 'reasoning_llm'",
+                    (system_id, snapshot_id),
+                )
+                pattern_ids = {}
+                for pat in scan.patterns:
+                    pcur = conn.execute(
+                        """INSERT INTO code_entrypoint_patterns
+                               (system_id, snapshot_id, intelligence_run_id,
+                                file_glob, regex, method_group, path_group,
+                                method_constant, framework, language, reason,
+                                confidence, match_count, examples_json, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            system_id, snapshot_id, run_id, pat.file_glob,
+                            pat.regex, pat.method_group, pat.path_group,
+                            pat.method_constant, pat.framework, pat.language,
+                            pat.reason, pat.confidence, 0,
+                            json.dumps([
+                                {"path": p, "line": ln} for p, ln in pat.examples
+                            ]),
+                            now,
+                        ),
+                    )
+                    pattern_ids[(pat.file_glob, pat.regex)] = (pcur.lastrowid, pat)
+
+                # Attribute each extracted entrypoint to the first pattern whose
+                # glob+framework matches, for the per-pattern match_count.
+                match_counts = {pid: 0 for pid, _ in pattern_ids.values()}
+                for ep in extracted:
+                    evidence_json = json.dumps([
+                        {"path": ev.path, "start_line": ev.start_line,
+                         "end_line": ev.end_line, "summary": ev.summary}
+                        for ev in ep.evidence
+                    ])
+                    matched_pid = None
+                    for pid, pat in pattern_ids.values():
+                        if ep.framework == pat.framework and fnmatch.fnmatch(
+                            ep.path, pat.file_glob
+                        ):
+                            matched_pid = pid
+                            break
+                    if matched_pid is not None:
+                        match_counts[matched_pid] = match_counts.get(matched_pid, 0) + 1
+                    conn.execute(
+                        """INSERT OR IGNORE INTO code_entrypoints
+                               (system_id, snapshot_id, entrypoint_type, entrypoint_id,
+                                category, label, operation, framework, handler_symbol_id,
+                                handler_path, handler_qualified_name, line_start, line_end,
+                                route_method, route_path, confidence, evidence_json,
+                                source, pattern_id, created_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?,
+                                   'reasoning_llm', ?, ?)""",
+                        (
+                            system_id, snapshot_id, ep.entrypoint_type,
+                            ep.entrypoint_id, ep.category, ep.label, ep.operation,
+                            ep.framework, ep.path, ep.qualified_name, ep.line_start,
+                            ep.line_end, ep.route_method, ep.route_path,
+                            ep.confidence, evidence_json, matched_pid, now,
+                        ),
+                    )
+                for pid, count in match_counts.items():
+                    conn.execute(
+                        "UPDATE code_entrypoint_patterns SET match_count = ? WHERE id = ?",
+                        (count, pid),
+                    )
+
+            pattern_rows = conn.execute(
+                "SELECT * FROM code_entrypoint_patterns WHERE intelligence_run_id = ? "
+                "ORDER BY confidence DESC, id",
+                (run_id,),
+            ).fetchall()
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    frameworks = sorted({p["framework"] for p in pattern_rows if p["framework"]})
+    return ApiScanResultOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        commit_sha=snapshot_row["commit_sha"],
+        run_id=run_id,
+        status=status,
+        provider=scan.provider,
+        model=scan.model,
+        is_mock=scan.is_mock,
+        error=scan.error,
+        patterns=[_api_scan_pattern_out(p) for p in pattern_rows],
+        extracted_count=len(extracted) if status == "completed" else 0,
+        frameworks=frameworks,
+        diagnostics=extraction_diags,
+    )
+
+
+@router.get("/repository/api-scan", response_model=ApiScanResultOut)
+def get_api_scan(system_id: int = Depends(get_system_id)) -> ApiScanResultOut:
+    """Return the latest API scan (patterns + extracted count) for the snapshot."""
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            return ApiScanResultOut(system_id=system_id, status="none")
+        snapshot_id = snapshot_row["id"]
+        run = conn.execute(
+            """SELECT * FROM intelligence_runs
+               WHERE system_id = ? AND snapshot_id = ? AND run_type = 'api_scan'
+               ORDER BY id DESC LIMIT 1""",
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run is None:
+            return ApiScanResultOut(
+                system_id=system_id, snapshot_id=snapshot_id,
+                commit_sha=snapshot_row["commit_sha"], status="none",
+            )
+        pattern_rows = conn.execute(
+            "SELECT * FROM code_entrypoint_patterns WHERE intelligence_run_id = ? "
+            "ORDER BY confidence DESC, id",
+            (run["id"],),
+        ).fetchall()
+        extracted_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM code_entrypoints WHERE system_id = ? "
+            "AND snapshot_id = ? AND source = 'reasoning_llm'",
+            (system_id, snapshot_id),
+        ).fetchone()["c"]
+
+    frameworks = sorted({p["framework"] for p in pattern_rows if p["framework"]})
+    return ApiScanResultOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        commit_sha=snapshot_row["commit_sha"],
+        run_id=run["id"],
+        status=run["status"],
+        provider=run["provider"],
+        model=run["model"],
+        is_mock=bool(run["is_mock"]),
+        error=run["error_details"],
+        patterns=[_api_scan_pattern_out(p) for p in pattern_rows],
+        extracted_count=extracted_count,
+        frameworks=frameworks,
+        diagnostics=[],
+    )
+
+
+def _preview_out(preview) -> ProbePreviewOut:
+    return ProbePreviewOut(
+        recommended_mode=preview.recommended_mode,
+        captured_data=preview.captured_data,
+        redaction=preview.redaction,
+        replayability=preview.replayability,
+        estimated_event_volume=preview.estimated_event_volume,
+        side_effect_risk=preview.side_effect_risk,
+        denylist_hit=preview.denylist_hit,
+    )
+
+
+def _flow_graph_out(system_id: int, graph) -> FlowGraphOut:
+    from ..flow_graph import build_edge_preview, build_node_preview
+
+    nodes_by_id = {n.node_id: n for n in graph.nodes}
+    return FlowGraphOut(
+        system_id=system_id,
+        snapshot_id=graph.snapshot_id,
+        commit_sha=graph.commit_sha,
+        entrypoint=_entrypoint_out(graph.entrypoint),
+        nodes=[
+            FlowNodeOut(
+                node_id=n.node_id,
+                node_type=n.node_type,
+                symbol_id=n.symbol_id,
+                qualified_name=n.qualified_name,
+                path=n.path,
+                line_start=n.line_start,
+                line_end=n.line_end,
+                component_id=n.component_id,
+                probe_capabilities=n.probe_capabilities,
+                risk=n.risk,
+                denylist_hit=n.denylist_hit,
+                evidence=_evidence_refs_out(n.evidence),
+                boundary_kind=n.boundary_kind,
+                is_external=n.is_external,
+                trace_count=n.trace_count,
+                error_count=n.error_count,
+                evaluation_pass=n.evaluation_pass,
+                evaluation_fail=n.evaluation_fail,
+                observed=n.observed,
+                preview=(
+                    None if n.is_external
+                    else _preview_out(build_node_preview(n))
+                ),
+            )
+            for n in graph.nodes
+        ],
+        edges=[
+            FlowEdgeOut(
+                edge_id=e.edge_id,
+                source_node_id=e.source_node_id,
+                target_node_id=e.target_node_id,
+                edge_type=e.edge_type,
+                confidence=e.confidence,
+                resolution=e.resolution,
+                callee_name=e.callee_name,
+                line=e.line,
+                evidence=_evidence_refs_out(e.evidence),
+                preview=_preview_out(build_edge_preview(
+                    e,
+                    nodes_by_id.get(e.source_node_id),
+                    nodes_by_id.get(e.target_node_id) if e.target_node_id else None,
+                )),
+            )
+            for e in graph.edges
+        ],
+        candidate_paths=[
+            CandidateFlowOut(
+                flow_id=c.flow_id,
+                title=c.title,
+                summary=c.summary,
+                entrypoint_node_id=c.entrypoint_node_id,
+                node_ids=c.node_ids,
+                node_count=c.node_count,
+                max_depth=c.max_depth,
+                confidence=c.confidence,
+                unresolved_edge_count=c.unresolved_edge_count,
+                external_boundary_count=c.external_boundary_count,
+                observed_node_count=c.observed_node_count,
+                unobserved_node_ids=c.unobserved_node_ids,
+            )
+            for c in graph.candidate_paths
+        ],
+        diagnostics=graph.diagnostics,
+        truncated=graph.truncated,
+    )
+
+
+def _overlay_runtime(system_id: int, graph) -> None:
+    """Overlay real trace/evaluation data onto in-repo nodes (Phase 2/3).
+
+    Only nodes that carry a component_id (i.e. already instrumented symbols)
+    can have runtime observations. Boundary nodes and uninstrumented symbols
+    stay at zero. This reads aggregate counts only; no payloads are exposed.
+    """
+    from ..flow_graph import apply_observed_overlay
+
+    component_ids = sorted({
+        n.component_id for n in graph.nodes if n.component_id
+    })
+    if component_ids:
+        placeholders = ",".join("?" for _ in component_ids)
+        with get_conn() as conn:
+            trace_rows = conn.execute(
+                f"""SELECT component_id,
+                           COUNT(*) AS total,
+                           SUM(CASE WHEN error IS NOT NULL AND error != '' THEN 1 ELSE 0 END) AS errors
+                    FROM traces
+                    WHERE system_id = ? AND component_id IN ({placeholders})
+                    GROUP BY component_id""",
+                (system_id, *component_ids),
+            ).fetchall()
+            eval_rows = conn.execute(
+                f"""SELECT component_id,
+                           SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS passed,
+                           SUM(CASE WHEN status = 'ng' THEN 1 ELSE 0 END) AS failed
+                    FROM evaluation_results
+                    WHERE system_id = ? AND component_id IN ({placeholders})
+                    GROUP BY component_id""",
+                (system_id, *component_ids),
+            ).fetchall()
+        traces_by_comp = {r["component_id"]: r for r in trace_rows}
+        evals_by_comp = {r["component_id"]: r for r in eval_rows}
+        for node in graph.nodes:
+            if not node.component_id:
+                continue
+            tr = traces_by_comp.get(node.component_id)
+            if tr:
+                node.trace_count = tr["total"] or 0
+                node.error_count = tr["errors"] or 0
+                node.observed = node.trace_count > 0
+            ev = evals_by_comp.get(node.component_id)
+            if ev:
+                node.evaluation_pass = ev["passed"] or 0
+                node.evaluation_fail = ev["failed"] or 0
+    apply_observed_overlay(graph)
+
+
+@router.post("/repository/flow-graphs", response_model=FlowGraphOut)
+def build_flow_graph_endpoint(
+    payload: FlowGraphRequest,
+    system_id: int = Depends(get_system_id),
+) -> FlowGraphOut:
+    from ..entrypoint_discovery import discover_entrypoints
+    from ..flow_graph import build_flow_graph
+
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
+    )
+    if graph is None:
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
+    _overlay_runtime(system_id, graph)
+    return _flow_graph_out(system_id, graph)
+
+
+def _raise_entrypoint_not_found(entrypoint_id: str, llm_eps) -> None:
+    """Raise a 404, or a clearer 422 for LLM-discovered API entrypoints.
+
+    Entrypoints recovered from LLM-generated regexes have no resolved handler
+    symbol, so a deterministic call tree cannot be rooted from them yet.
+    """
+    if any(e.entrypoint_id == entrypoint_id for e in llm_eps):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This API was detected by an LLM-generated regex and is not yet "
+                "mapped to a handler symbol, so a process tree cannot be built "
+                "from it. It is listed for visibility only."
+            ),
+        )
+    raise HTTPException(
+        status_code=404,
+        detail=f"Entrypoint not found in snapshot: {entrypoint_id}",
+    )
+
+
+def _component_id_for(qualified_name: str) -> str:
+    base = qualified_name.rsplit(".", 1)[-1]
+    kebab = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return f"{kebab}-observer" if kebab else "flow-observer"
+
+
+@router.post(
+    "/repository/probe-plans/from-flow",
+    response_model=ProbePlanOut,
+    status_code=201,
+)
+def create_probe_plan_from_flow(
+    payload: ProbePlanFromFlowRequest,
+    system_id: int = Depends(get_system_id),
+) -> ProbePlanOut:
+    """Convert user-selected flow nodes into a manual Probe Plan draft.
+
+    This is an explicit, user-driven selection (decision_method=manual). It
+    only records a draft; it does not generate, apply, or run any patch.
+    """
+    from ..entrypoint_discovery import discover_entrypoints
+    from ..flow_graph import (
+        build_edge_preview,
+        build_flow_graph,
+        build_node_preview,
+    )
+
+    snapshot_row, symbols, files = _load_flow_inputs(
+        system_id, payload.snapshot_id, payload.commit_sha,
+    )
+    llm_eps = _load_persisted_api_entrypoints(system_id, snapshot_row["id"])
+    discovery = discover_entrypoints(symbols, files, persisted_api=llm_eps)
+    graph = build_flow_graph(
+        symbols=symbols,
+        files=files,
+        snapshot_id=snapshot_row["id"],
+        commit_sha=snapshot_row["commit_sha"],
+        entrypoint_type=payload.entrypoint_type,
+        entrypoint_id=payload.entrypoint_id,
+        max_depth=payload.max_depth,
+        max_nodes=payload.max_nodes,
+        entrypoints=discovery.entrypoints + discovery.functions,
+    )
+    if graph is None:
+        _raise_entrypoint_not_found(payload.entrypoint_id, llm_eps)
+
+    nodes_by_id = {n.node_id: n for n in graph.nodes}
+    edges_by_id = {e.edge_id: e for e in graph.edges}
+
+    # Resolve each selection to (the in-repo symbol node to instrument, a probe
+    # reason, and a deterministic preview). Edge/boundary selections always map
+    # to the in-repo caller; external nodes are never instrumented directly.
+    resolved_selections = []
+    for sel in payload.selections:
+        if sel.target_type == "edge":
+            edge = edges_by_id.get(sel.edge_id)
+            if edge is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected edge is not part of this flow graph: {sel.edge_id}",
+                )
+            caller = nodes_by_id.get(edge.source_node_id)
+            if caller is None or caller.is_external:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Edge source is not an instrumentable node: {sel.edge_id}",
+                )
+            target = (
+                nodes_by_id.get(edge.target_node_id)
+                if edge.target_node_id else None
+            )
+            preview = build_edge_preview(edge, caller, target)
+            callee = target.qualified_name if target else edge.callee_name
+            reason = (
+                f"User-selected call boundary in flow '{graph.entrypoint.label}': "
+                f"observe before/after {edge.callee_name}() "
+                f"({edge.edge_type}) at {caller.path}:{edge.line}. Target: {callee}."
+            )
+            resolved_selections.append((sel, caller, "boundary", reason, preview))
+        else:
+            node = nodes_by_id.get(sel.node_id)
+            if node is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Selected node is not part of this flow graph: {sel.node_id}",
+                )
+            if node.is_external:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "External boundary nodes cannot be instrumented directly. "
+                        "Select the in-repo caller and observe its call boundary instead: "
+                        f"{sel.node_id}"
+                    ),
+                )
+            preview = build_node_preview(node)
+            observation = {
+                "input": "function input",
+                "output": "function output / return / error",
+                "boundary": "call boundary (before/after)",
+            }[sel.observation]
+            reason = (
+                f"User-selected from execution flow '{graph.entrypoint.label}'. "
+                f"Observe {observation}."
+            )
+            resolved_selections.append((sel, node, sel.observation, reason, preview))
+
+    snapshot_id = snapshot_row["id"]
+    now = time.time()
+    feature_id = payload.entrypoint_id
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """INSERT INTO intelligence_runs
+                       (system_id, snapshot_id, run_type, provider, model,
+                        prompt_version, schema_version, decision_method,
+                        status, is_mock, started_at, completed_at)
+                   VALUES (?, ?, 'probe_plan_from_flow', 'manual', 'n/a',
+                           'flow-v1', 'flow-v1', 'manual',
+                           'completed', 0, ?, ?)""",
+                (system_id, snapshot_id, now, now),
+            )
+            run_id = cur.lastrowid
+
+            cur = conn.execute(
+                """INSERT INTO probe_plans
+                       (system_id, snapshot_id, intelligence_run_id,
+                        feature_id, objective, status, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                (
+                    system_id, snapshot_id, run_id, feature_id,
+                    payload.objective.strip(), now, now,
+                ),
+            )
+            plan_id = cur.lastrowid
+
+            for sel, node, _obs, reason, preview in resolved_selections:
+                # The preview carries the deterministic risk/replayability/
+                # denylist assessment for the instrumented (in-repo) symbol or
+                # its observed boundary.
+                denylist_hit = preview.denylist_hit
+                risk = preview.side_effect_risk
+                conn.execute(
+                    """INSERT INTO probe_points
+                           (plan_id, system_id, component_id, feature_id,
+                            path, symbol, line_start, line_end, reason,
+                            recommended_mode, side_effect_risk, replayability,
+                            denylist_hit, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?, ?)""",
+                    (
+                        plan_id, system_id,
+                        node.component_id or _component_id_for(node.qualified_name),
+                        feature_id, node.path, node.qualified_name,
+                        node.line_start, node.line_end, reason,
+                        sel.mode_preference, risk, preview.replayability,
+                        denylist_hit, now, now,
+                    ),
+                )
+
+            plan_row = conn.execute(
+                "SELECT * FROM probe_plans WHERE id = ?", (plan_id,),
+            ).fetchone()
+            result = _probe_plan_out(conn, plan_row)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Patch generation
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-plans/{plan_id}/patch",
+    response_model=ProbePatchOut,
+    status_code=201,
+)
+def generate_patch_endpoint(
+    plan_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    from ..patch_generator import ApprovedPoint, generate_patch
+
+    with get_conn() as conn:
+        plan_row = conn.execute(
+            "SELECT * FROM probe_plans WHERE id = ? AND system_id = ?",
+            (plan_id, system_id),
+        ).fetchone()
+    if plan_row is None:
+        raise HTTPException(status_code=404, detail="Probe plan not found")
+
+    snapshot_id = plan_row["snapshot_id"]
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchone()
+    if snapshot_row is None or snapshot_row["status"] != "ready":
+        raise HTTPException(status_code=400, detail="Snapshot is not ready")
+    if not snapshot_row["repo_path"]:
+        raise HTTPException(status_code=409, detail="Snapshot repository path is unavailable")
+
+    with get_conn() as conn:
+        point_rows = conn.execute(
+            """SELECT * FROM probe_points
+               WHERE plan_id = ? AND status = 'approved'
+                 AND denylist_hit IS NULL
+               ORDER BY path, line_start""",
+            (plan_id,),
+        ).fetchall()
+    if not point_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No approved probe points. Approve points before generating a patch.",
+        )
+
+    approved = [
+        ApprovedPoint(
+            component_id=r["component_id"],
+            path=r["path"],
+            symbol=r["symbol"],
+            recommended_mode=r["recommended_mode"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+        )
+        for r in point_rows
+    ]
+
+    worktree_base = os.getenv("PROBE_WORKTREE_BASE", "/tmp/probe-worktrees")
+    os.makedirs(worktree_base, exist_ok=True)
+
+    patch_result = generate_patch(
+        repo_path=snapshot_row["repo_path"],
+        commit_sha=snapshot_row["commit_sha"],
+        approved_points=approved,
+        worktree_base=worktree_base,
+    )
+
+    now = time.time()
+    patch_status = "generated" if patch_result.error is None else "failed"
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO probe_patches
+                   (plan_id, system_id, snapshot_id, commit_sha, diff,
+                    worktree_path, skipped, status, error,
+                    cleanup_state, cleanup_error, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                plan_id, system_id, snapshot_id,
+                snapshot_row["commit_sha"], patch_result.diff,
+                patch_result.worktree_path,
+                json.dumps(patch_result.skipped),
+                patch_status, patch_result.error,
+                patch_result.cleanup_state, patch_result.cleanup_error, now,
+            ),
+        )
+        patch_id = cur.lastrowid
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ?", (patch_id,),
+        ).fetchone()
+
+    with get_conn() as conn:
+        return _probe_patch_out(conn, row)
+
+
+@router.get("/repository/probe-patches", response_model=List[ProbePatchOut])
+def list_probe_patches(
+    system_id: int = Depends(get_system_id),
+) -> List[ProbePatchOut]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM probe_patches WHERE system_id = ? ORDER BY id DESC",
+            (system_id,),
+        ).fetchall()
+        return [_probe_patch_out(conn, row) for row in rows]
+
+
+@router.get("/repository/probe-patches/{patch_id}", response_model=ProbePatchOut)
+def get_probe_patch(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Patch not found")
+
+        return _probe_patch_out(conn, row)
+
+
+@router.get("/repository/probe-patches/{patch_id}/download")
+def download_probe_patch(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> Response:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT diff FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Patch not found")
+    return Response(
+        content=row["diff"],
+        media_type="text/x-diff",
+        headers={
+            "Content-Disposition": f'attachment; filename="probe-patch-{patch_id}.diff"'
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Explicit application to the source repository
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-patches/{patch_id}/apply",
+    response_model=ProbePatchOut,
+)
+def apply_probe_patch_endpoint(
+    patch_id: int,
+    payload: ProbePatchApplyRequest,
+    system_id: int = Depends(get_system_id),
+    principal: Principal = Depends(require_user),
+) -> ProbePatchOut:
+    from ..patch_generator import apply_patch_to_repository
+
+    with get_conn() as conn:
+        patch_row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+        if patch_row is None:
+            raise HTTPException(status_code=404, detail="Patch not found")
+        snapshot_row = conn.execute(
+            "SELECT * FROM repository_snapshots WHERE id = ? AND system_id = ?",
+            (patch_row["snapshot_id"], system_id),
+        ).fetchone()
+        validation_rows = conn.execute(
+            """
+            SELECT variant, overall_success
+            FROM validation_runs
+            WHERE patch_id = ?
+            ORDER BY id DESC
+            """,
+            (patch_id,),
+        ).fetchall()
+
+    if patch_row["apply_status"] == "applied":
+        raise HTTPException(status_code=409, detail="Patch has already been applied")
+    if patch_row["status"] == "failed" or not patch_row["diff"].strip():
+        raise HTTPException(status_code=400, detail="Patch is not applicable")
+    if payload.expected_commit_sha != patch_row["commit_sha"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Confirmation commit does not match the patch snapshot",
+        )
+    if snapshot_row is None or not snapshot_row["repo_path"]:
+        raise HTTPException(
+            status_code=409,
+            detail="Snapshot repository path is unavailable",
+        )
+
+    latest_validation = {}
+    for row in validation_rows:
+        latest_validation.setdefault(row["variant"], bool(row["overall_success"]))
+    if not (
+        latest_validation.get("baseline") is True
+        and latest_validation.get("probed") is True
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="A successful baseline and probed validation is required",
+        )
+
+    apply_error = apply_patch_to_repository(
+        snapshot_row["repo_path"],
+        patch_row["commit_sha"],
+        patch_row["diff"],
+    )
+    now = time.time()
+    with get_conn() as conn:
+        if apply_error:
+            conn.execute(
+                """
+                UPDATE probe_patches
+                SET apply_status = 'failed', apply_error = ?
+                WHERE id = ?
+                """,
+                (apply_error, patch_id),
+            )
+            raise HTTPException(status_code=409, detail=apply_error)
+        conn.execute(
+            """
+            UPDATE probe_patches
+            SET apply_status = 'applied', apply_error = NULL,
+                applied_at = ?, applied_by_user_id = ?
+            WHERE id = ?
+            """,
+            (now, principal.user_id, patch_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ?", (patch_id,)
+        ).fetchone()
+        return _probe_patch_out(conn, row)
+
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/repository/probe-patches/{patch_id}/validate",
+    response_model=ProbePatchOut,
+    status_code=201,
+)
+def validate_patch_endpoint(
+    patch_id: int,
+    system_id: int = Depends(get_system_id),
+) -> ProbePatchOut:
+    from ..patch_generator import (
+        apply_unified_diff,
+        cleanup_worktree,
+        create_worktree,
+    )
+    from ..validation_runner import load_validation_config_text, run_validation
+
+    with get_conn() as conn:
+        patch_row = conn.execute(
+            "SELECT * FROM probe_patches WHERE id = ? AND system_id = ?",
+            (patch_id, system_id),
+        ).fetchone()
+    if patch_row is None:
+        raise HTTPException(status_code=404, detail="Patch not found")
+    if patch_row["status"] == "failed":
+        raise HTTPException(status_code=400, detail="Cannot validate a failed patch")
+
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE id = ? AND system_id = ?
+            """,
+            (patch_row["snapshot_id"], system_id),
+        ).fetchone()
+        config_file = conn.execute(
+            """
+            SELECT path, content FROM snapshot_files
+            WHERE snapshot_id = ? AND path IN ('probe-agent.yml', 'probe-agent.example.yml')
+            ORDER BY CASE path WHEN 'probe-agent.yml' THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (patch_row["snapshot_id"],),
+        ).fetchone()
+    if snapshot_row is None or not snapshot_row["repo_path"]:
+        raise HTTPException(status_code=409, detail="Snapshot repository path is unavailable")
+
+    repo_path = snapshot_row["repo_path"]
+    commit_sha = patch_row["commit_sha"]
+
+    try:
+        if config_file is not None:
+            config_bytes = bytes(config_file["content"] or b"")
+        else:
+            config_bytes = None
+            for config_path in ("probe-agent.yml", "probe-agent.example.yml"):
+                try:
+                    config_bytes = read_file_at_commit(
+                        repo_path, commit_sha, config_path
+                    )
+                    break
+                except GitError:
+                    continue
+            if config_bytes is None:
+                raise GitError(
+                    "probe-agent.yml is not present at the pinned commit"
+                )
+        val_config = load_validation_config_text(
+            config_bytes.decode("utf-8", errors="strict")
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid or missing pinned probe-agent.yml: {exc}",
+        )
+
+    worktree_base = os.getenv("PROBE_WORKTREE_BASE", "/tmp/probe-worktrees")
+    os.makedirs(worktree_base, exist_ok=True)
+
+    baseline_worktree = None
+    probed_worktree = None
+    now = time.time()
+    cleanup_results = {}
+
+    try:
+        baseline_worktree = create_worktree(
+            repo_path, commit_sha, worktree_base + "/baseline",
+        )
+        probed_worktree = create_worktree(
+            repo_path, commit_sha, worktree_base + "/probed",
+        )
+        patch_error = apply_unified_diff(probed_worktree, patch_row["diff"])
+        if patch_error:
+            raise GitError(f"Failed to apply stored patch: {patch_error}")
+    except GitError as exc:
+        if baseline_worktree:
+            cleanup_results["baseline"] = cleanup_worktree(
+                repo_path, baseline_worktree
+            )
+        if probed_worktree:
+            cleanup_results["probed"] = cleanup_worktree(repo_path, probed_worktree)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to prepare validation worktrees: {exc}",
+        )
+
+    try:
+        baseline_result = run_validation("baseline", baseline_worktree, val_config)
+        with get_conn() as conn:
+            trace_count_before = conn.execute(
+                "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["count"]
+        probed_result = run_validation("probed", probed_worktree, val_config)
+        with get_conn() as conn:
+            trace_count_after = conn.execute(
+                "SELECT COUNT(*) AS count FROM traces WHERE system_id = ?",
+                (system_id,),
+            ).fetchone()["count"]
+        probed_result.trace_received = trace_count_after > trace_count_before
+        probed_result.trace_status = (
+            "received" if probed_result.trace_received else "missing"
+        )
+    finally:
+        if baseline_worktree:
+            cleanup_results["baseline"] = cleanup_worktree(
+                repo_path, baseline_worktree
+            )
+        if probed_worktree:
+            cleanup_results["probed"] = cleanup_worktree(repo_path, probed_worktree)
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            for result in [baseline_result, probed_result]:
+                cleanup_result = cleanup_results.get(result.variant)
+                cleanup_state = (
+                    cleanup_result.state if cleanup_result else "not_attempted"
+                )
+                cleanup_error = cleanup_result.error if cleanup_result else None
+                cur = conn.execute(
+                    """INSERT INTO validation_runs
+                           (patch_id, system_id, variant, worktree_path,
+                            overall_success, total_duration_ms, trace_received,
+                            trace_status, network_isolation, cleanup_state,
+                            cleanup_error, error, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        patch_id, system_id, result.variant,
+                        result.worktree_path,
+                        1 if result.overall_success else 0,
+                        result.total_duration_ms,
+                        (
+                            None if getattr(result, "trace_received", None) is None
+                            else (1 if result.trace_received else 0)
+                        ),
+                        getattr(result, "trace_status", "not_checked"),
+                        result.network_isolation,
+                        cleanup_state,
+                        cleanup_error,
+                        result.error, now,
+                    ),
+                )
+                run_id = cur.lastrowid
+                for cmd in result.results:
+                    conn.execute(
+                        """INSERT INTO validation_commands
+                               (run_id, command, exit_code, duration_ms,
+                                stdout, stderr, stdout_truncated,
+                                stderr_truncated, timed_out)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id, cmd.command, cmd.exit_code,
+                            cmd.duration_ms, cmd.stdout, cmd.stderr,
+                            1 if cmd.stdout_truncated else 0,
+                            1 if cmd.stderr_truncated else 0,
+                            1 if cmd.timed_out else 0,
+                        ),
+                    )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return get_probe_patch(patch_id, system_id)

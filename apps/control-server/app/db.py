@@ -207,6 +207,572 @@ CREATE INDEX IF NOT EXISTS idx_generation_runs_trace
 
 CREATE INDEX IF NOT EXISTS idx_generation_runs_component
     ON generation_runs (system_id, component_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS repository_configs (
+    system_id       INTEGER PRIMARY KEY,
+    repo_path       TEXT NOT NULL,
+    include_patterns TEXT NOT NULL DEFAULT '[]',
+    exclude_patterns TEXT NOT NULL DEFAULT '[]',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS repository_snapshots (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id           INTEGER NOT NULL,
+    repo_path           TEXT NOT NULL DEFAULT '',
+    commit_sha          TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'indexing',
+    file_count          INTEGER NOT NULL DEFAULT 0,
+    total_size          INTEGER NOT NULL DEFAULT 0,
+    indexed_size        INTEGER NOT NULL DEFAULT 0,
+    metadata_only_count INTEGER NOT NULL DEFAULT 0,
+    warnings            TEXT NOT NULL DEFAULT '[]',
+    error_summary       TEXT,
+    created_at          REAL NOT NULL,
+    completed_at        REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshots_system
+    ON repository_snapshots (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS snapshot_files (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id      INTEGER NOT NULL,
+    path             TEXT NOT NULL,
+    source_type      TEXT NOT NULL,
+    size_bytes       INTEGER NOT NULL DEFAULT 0,
+    content_hash     TEXT,
+    content          BLOB NOT NULL DEFAULT X'',
+    inclusion_status TEXT NOT NULL DEFAULT 'indexed',
+    exclusion_reason TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_snapshot_files_snapshot
+    ON snapshot_files (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS intelligence_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    snapshot_id     INTEGER NOT NULL,
+    run_type        TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    model           TEXT NOT NULL,
+    prompt_version  TEXT NOT NULL,
+    schema_version  TEXT NOT NULL,
+    decision_method TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    error_details   TEXT,
+    is_mock         INTEGER NOT NULL DEFAULT 0,
+    started_at      REAL NOT NULL,
+    completed_at    REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_intelligence_runs_system
+    ON intelligence_runs (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS system_profile_drafts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    name                 TEXT NOT NULL DEFAULT '',
+    purpose              TEXT NOT NULL DEFAULT '',
+    target_users         TEXT NOT NULL DEFAULT '[]',
+    stakeholder_value    TEXT NOT NULL DEFAULT '',
+    constraints          TEXT NOT NULL DEFAULT '[]',
+    success_criteria     TEXT NOT NULL DEFAULT '[]',
+    is_mock              INTEGER NOT NULL DEFAULT 0,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_sp_drafts_system
+    ON system_profile_drafts (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS feature_drafts (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    feature_id           TEXT NOT NULL,
+    name                 TEXT NOT NULL,
+    summary              TEXT NOT NULL DEFAULT '',
+    user_value           TEXT NOT NULL DEFAULT '',
+    success_criteria     TEXT NOT NULL DEFAULT '[]',
+    risks                TEXT NOT NULL DEFAULT '[]',
+    decision_method      TEXT NOT NULL DEFAULT 'reasoning_llm',
+    is_mock              INTEGER NOT NULL DEFAULT 0,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_drafts_system
+    ON feature_drafts (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS draft_evidence (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    draft_type      TEXT NOT NULL,
+    draft_id        INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    start_line      INTEGER NOT NULL DEFAULT 0,
+    end_line        INTEGER NOT NULL DEFAULT 0,
+    summary         TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_draft_evidence_draft
+    ON draft_evidence (draft_type, draft_id);
+
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    qualified_name  TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    start_line      INTEGER NOT NULL,
+    end_line        INTEGER NOT NULL,
+    decorators      TEXT NOT NULL DEFAULT '[]',
+    imports         TEXT NOT NULL DEFAULT '[]',
+    docstring       TEXT,
+    is_test         INTEGER NOT NULL DEFAULT 0,
+    is_pydantic_model INTEGER NOT NULL DEFAULT 0,
+    route_path      TEXT,
+    route_method    TEXT,
+    component_id    TEXT,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_symbols_snapshot_name
+    ON code_symbols (snapshot_id, qualified_name, path);
+
+CREATE INDEX IF NOT EXISTS idx_code_symbols_snapshot
+    ON code_symbols (snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_symbols_system
+    ON code_symbols (system_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS symbol_index_warnings (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id     INTEGER NOT NULL,
+    system_id       INTEGER NOT NULL,
+    path            TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_symbol_warnings_snapshot
+    ON symbol_index_warnings (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS code_entrypoints (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    entrypoint_type         TEXT NOT NULL,
+    entrypoint_id           TEXT NOT NULL,
+    category                TEXT NOT NULL,
+    label                   TEXT NOT NULL,
+    operation               TEXT,
+    framework               TEXT,
+    handler_symbol_id       INTEGER,
+    handler_path            TEXT NOT NULL,
+    handler_qualified_name  TEXT NOT NULL,
+    line_start              INTEGER NOT NULL,
+    line_end                INTEGER NOT NULL,
+    route_method            TEXT,
+    route_path              TEXT,
+    confidence              REAL NOT NULL DEFAULT 1.0,
+    evidence_json           TEXT NOT NULL DEFAULT '[]',
+    source                  TEXT NOT NULL DEFAULT 'deterministic',
+    pattern_id              INTEGER,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (handler_symbol_id) REFERENCES code_symbols (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_code_entrypoints_unique
+    ON code_entrypoints (snapshot_id, entrypoint_type, entrypoint_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoints_system
+    ON code_entrypoints (system_id, snapshot_id);
+
+CREATE TABLE IF NOT EXISTS code_entrypoint_patterns (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    file_glob               TEXT NOT NULL,
+    regex                   TEXT NOT NULL,
+    method_group            TEXT,
+    path_group              TEXT,
+    method_constant         TEXT,
+    framework               TEXT NOT NULL,
+    language                TEXT NOT NULL,
+    reason                  TEXT NOT NULL,
+    confidence              REAL NOT NULL DEFAULT 0.0,
+    match_count             INTEGER NOT NULL DEFAULT 0,
+    examples_json           TEXT NOT NULL DEFAULT '[]',
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoint_patterns_system
+    ON code_entrypoint_patterns (system_id, snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_code_entrypoint_patterns_run
+    ON code_entrypoint_patterns (intelligence_run_id);
+
+CREATE TABLE IF NOT EXISTS feature_code_links (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id       INTEGER NOT NULL,
+    snapshot_id     INTEGER NOT NULL,
+    intelligence_run_id INTEGER NOT NULL,
+    feature_id      TEXT NOT NULL,
+    symbol_id       INTEGER NOT NULL,
+    relation_reason TEXT NOT NULL,
+    confidence      REAL NOT NULL DEFAULT 0.0,
+    source          TEXT NOT NULL DEFAULT 'reasoning_llm',
+    review_status   TEXT NOT NULL DEFAULT 'proposed',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (symbol_id) REFERENCES code_symbols (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_system
+    ON feature_code_links (system_id, snapshot_id);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_feature
+    ON feature_code_links (system_id, feature_id);
+
+CREATE INDEX IF NOT EXISTS idx_feature_code_links_run
+    ON feature_code_links (intelligence_run_id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feature_code_links_run_symbol
+    ON feature_code_links (intelligence_run_id, feature_id, symbol_id);
+
+CREATE TABLE IF NOT EXISTS probe_plans (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    intelligence_run_id  INTEGER NOT NULL,
+    feature_id           TEXT NOT NULL,
+    objective            TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'proposed',
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_plans_system
+    ON probe_plans (system_id, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_probe_plans_feature
+    ON probe_plans (system_id, feature_id);
+
+CREATE TABLE IF NOT EXISTS probe_points (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    component_id         TEXT NOT NULL,
+    feature_id           TEXT NOT NULL,
+    path                 TEXT NOT NULL,
+    symbol               TEXT NOT NULL,
+    line_start           INTEGER NOT NULL,
+    line_end             INTEGER NOT NULL,
+    reason               TEXT NOT NULL,
+    recommended_mode     TEXT NOT NULL DEFAULT 'trace',
+    side_effect_risk     TEXT NOT NULL DEFAULT 'low',
+    replayability        TEXT NOT NULL DEFAULT '',
+    denylist_hit         TEXT,
+    status               TEXT NOT NULL DEFAULT 'proposed',
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL,
+    FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_points_plan
+    ON probe_points (plan_id);
+
+CREATE INDEX IF NOT EXISTS idx_probe_points_system
+    ON probe_points (system_id, plan_id);
+
+CREATE TABLE IF NOT EXISTS probe_patches (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id              INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    commit_sha           TEXT NOT NULL,
+    diff                 TEXT NOT NULL DEFAULT '',
+    worktree_path        TEXT,
+    skipped              TEXT NOT NULL DEFAULT '[]',
+    status               TEXT NOT NULL DEFAULT 'generated',
+    error                TEXT,
+    cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error        TEXT,
+    apply_status         TEXT NOT NULL DEFAULT 'not_applied',
+    apply_error          TEXT,
+    applied_at           REAL,
+    applied_by_user_id   INTEGER,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (plan_id) REFERENCES probe_plans (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (applied_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_probe_patches_plan
+    ON probe_patches (plan_id);
+
+CREATE TABLE IF NOT EXISTS validation_runs (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    patch_id             INTEGER NOT NULL,
+    system_id            INTEGER NOT NULL,
+    variant              TEXT NOT NULL,
+    worktree_path        TEXT NOT NULL,
+    overall_success      INTEGER NOT NULL DEFAULT 0,
+    total_duration_ms    REAL NOT NULL DEFAULT 0.0,
+    trace_received       INTEGER,
+    trace_status         TEXT NOT NULL DEFAULT 'not_checked',
+    network_isolation    TEXT NOT NULL DEFAULT 'not_requested',
+    cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error        TEXT,
+    error                TEXT,
+    created_at           REAL NOT NULL,
+    FOREIGN KEY (patch_id) REFERENCES probe_patches (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_runs_patch
+    ON validation_runs (patch_id);
+
+CREATE TABLE IF NOT EXISTS validation_commands (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id               INTEGER NOT NULL,
+    command              TEXT NOT NULL,
+    exit_code            INTEGER NOT NULL,
+    duration_ms          REAL NOT NULL DEFAULT 0.0,
+    stdout               TEXT NOT NULL DEFAULT '',
+    stderr               TEXT NOT NULL DEFAULT '',
+    stdout_truncated     INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated     INTEGER NOT NULL DEFAULT 0,
+    timed_out            INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (run_id) REFERENCES validation_runs (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_commands_run
+    ON validation_commands (run_id);
+
+CREATE TABLE IF NOT EXISTS experiments (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id            INTEGER NOT NULL,
+    feature_id           TEXT NOT NULL,
+    objective            TEXT NOT NULL,
+    snapshot_id          INTEGER NOT NULL,
+    baseline_commit      TEXT NOT NULL,
+    config_revision      TEXT NOT NULL,
+    execution_config     TEXT NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'draft',
+    error                TEXT,
+    human_decision       TEXT NOT NULL DEFAULT 'undecided',
+    human_decision_variant_key TEXT,
+    human_decision_note  TEXT NOT NULL DEFAULT '',
+    created_at           REAL NOT NULL,
+    started_at           REAL,
+    completed_at         REAL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiments_system
+    ON experiments (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS experiment_variants (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    experiment_id        INTEGER NOT NULL,
+    variant_key          TEXT NOT NULL,
+    label                TEXT NOT NULL,
+    is_baseline          INTEGER NOT NULL DEFAULT 0,
+    patch_text           TEXT NOT NULL DEFAULT '',
+    patch_hash           TEXT NOT NULL,
+    source               TEXT NOT NULL DEFAULT 'manual',
+    risk_note            TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'planned',
+    error                TEXT,
+    workspace_path       TEXT,
+    cleanup_state        TEXT NOT NULL DEFAULT 'not_attempted',
+    cleanup_error        TEXT,
+    metrics_json         TEXT NOT NULL DEFAULT '{}',
+    artifacts_json       TEXT NOT NULL DEFAULT '{}',
+    started_at           REAL,
+    completed_at         REAL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE,
+    UNIQUE (experiment_id, variant_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_variants_experiment
+    ON experiment_variants (experiment_id, id);
+
+CREATE TABLE IF NOT EXISTS experiment_commands (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant_id           INTEGER NOT NULL,
+    phase                TEXT NOT NULL,
+    command              TEXT NOT NULL,
+    exit_code            INTEGER NOT NULL,
+    duration_ms          REAL NOT NULL DEFAULT 0.0,
+    stdout               TEXT NOT NULL DEFAULT '',
+    stderr               TEXT NOT NULL DEFAULT '',
+    stdout_truncated     INTEGER NOT NULL DEFAULT 0,
+    stderr_truncated     INTEGER NOT NULL DEFAULT 0,
+    timed_out            INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (variant_id) REFERENCES experiment_variants (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiment_commands_variant
+    ON experiment_commands (variant_id, id);
+
+CREATE TABLE IF NOT EXISTS experiment_analyses (
+    experiment_id        INTEGER PRIMARY KEY,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    provider             TEXT,
+    model                TEXT,
+    prompt_version       TEXT,
+    schema_version       TEXT,
+    decision_method      TEXT,
+    narrative            TEXT,
+    recommendation_variant_key TEXT,
+    recommendation_reason TEXT,
+    risks_json           TEXT NOT NULL DEFAULT '[]',
+    error                TEXT,
+    created_at           REAL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments (id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id     INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    focus         TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'active',
+    summary       TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspaces_system
+    ON workspaces (system_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_messages (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id      INTEGER NOT NULL,
+    system_id         INTEGER NOT NULL,
+    role              TEXT NOT NULL,
+    content           TEXT NOT NULL,
+    context_metadata  TEXT NOT NULL DEFAULT '{}',
+    created_at        REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_messages_workspace
+    ON workspace_messages (workspace_id, id);
+
+CREATE TABLE IF NOT EXISTS workspace_context_items (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id  INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    item_type     TEXT NOT NULL,
+    item_id       TEXT NOT NULL,
+    label         TEXT NOT NULL DEFAULT '',
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_context_items_workspace
+    ON workspace_context_items (workspace_id, id);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_context_items_unique
+    ON workspace_context_items (workspace_id, item_type, item_id);
+
+CREATE TABLE IF NOT EXISTS workspace_proposals (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id  INTEGER NOT NULL,
+    system_id     INTEGER NOT NULL,
+    message_id    INTEGER,
+    proposal_type TEXT NOT NULL,
+    title         TEXT NOT NULL DEFAULT '',
+    body          TEXT NOT NULL DEFAULT '{}',
+    status        TEXT NOT NULL DEFAULT 'proposed',
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES workspace_messages (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_proposals_workspace
+    ON workspace_proposals (workspace_id, id);
+
+CREATE TABLE IF NOT EXISTS workspace_decisions (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    proposal_id         INTEGER NOT NULL,
+    workspace_id        INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    decision            TEXT NOT NULL,
+    reason              TEXT NOT NULL DEFAULT '',
+    decided_by_user_id  INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (proposal_id) REFERENCES workspace_proposals (id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (decided_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_decisions_proposal
+    ON workspace_decisions (proposal_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_proposal_drafts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id        INTEGER NOT NULL,
+    proposal_id         INTEGER NOT NULL,
+    system_id           INTEGER NOT NULL,
+    draft_type          TEXT NOT NULL,
+    target_screen       TEXT NOT NULL,
+    payload             TEXT NOT NULL DEFAULT '{}',
+    missing_fields      TEXT NOT NULL DEFAULT '[]',
+    created_by_user_id  INTEGER,
+    created_at          REAL NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces (id) ON DELETE CASCADE,
+    FOREIGN KEY (proposal_id) REFERENCES workspace_proposals (id) ON DELETE CASCADE,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (created_by_user_id) REFERENCES users (id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_proposal_drafts_proposal
+    ON workspace_proposal_drafts (proposal_id);
 """
 
 
@@ -371,6 +937,113 @@ def init_db() -> None:
     with get_conn() as conn:
         _migrate_to_system_scope(conn)
         conn.executescript(SCHEMA)
+        if "content" not in _columns(conn, "snapshot_files"):
+            conn.execute(
+                "ALTER TABLE snapshot_files ADD COLUMN content BLOB NOT NULL DEFAULT X''"
+            )
+        sf_cols = _columns(conn, "snapshot_files")
+        if "inclusion_status" not in sf_cols:
+            conn.execute(
+                "ALTER TABLE snapshot_files "
+                "ADD COLUMN inclusion_status TEXT NOT NULL DEFAULT 'indexed'"
+            )
+        if "exclusion_reason" not in sf_cols:
+            conn.execute(
+                "ALTER TABLE snapshot_files "
+                "ADD COLUMN exclusion_reason TEXT NOT NULL DEFAULT ''"
+            )
+        snap_cols = _columns(conn, "repository_snapshots")
+        if "indexed_size" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN indexed_size INTEGER NOT NULL DEFAULT 0"
+            )
+        if "metadata_only_count" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN metadata_only_count INTEGER NOT NULL DEFAULT 0"
+            )
+        if "warnings" not in snap_cols:
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "repo_path" not in _columns(conn, "repository_snapshots"):
+            conn.execute(
+                "ALTER TABLE repository_snapshots "
+                "ADD COLUMN repo_path TEXT NOT NULL DEFAULT ''"
+            )
+            conn.execute(
+                """
+                UPDATE repository_snapshots
+                SET repo_path = COALESCE(
+                    (SELECT repo_path FROM repository_configs
+                     WHERE repository_configs.system_id = repository_snapshots.system_id),
+                    ''
+                )
+                WHERE repo_path = ''
+                """
+            )
+        if "imports" not in _columns(conn, "code_symbols"):
+            conn.execute(
+                "ALTER TABLE code_symbols ADD COLUMN imports TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "component_id" not in _columns(conn, "code_symbols"):
+            conn.execute("ALTER TABLE code_symbols ADD COLUMN component_id TEXT")
+        validation_columns = _columns(conn, "validation_runs")
+        if "trace_received" not in validation_columns:
+            conn.execute("ALTER TABLE validation_runs ADD COLUMN trace_received INTEGER")
+        if "trace_status" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN trace_status TEXT NOT NULL DEFAULT 'not_checked'"
+            )
+        if "network_isolation" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN network_isolation TEXT NOT NULL DEFAULT 'not_requested'"
+            )
+        if "cleanup_state" not in validation_columns:
+            conn.execute(
+                "ALTER TABLE validation_runs ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_attempted'"
+            )
+        if "cleanup_error" not in validation_columns:
+            conn.execute("ALTER TABLE validation_runs ADD COLUMN cleanup_error TEXT")
+        patch_columns = _columns(conn, "probe_patches")
+        if "cleanup_state" not in patch_columns:
+            conn.execute(
+                "ALTER TABLE probe_patches "
+                "ADD COLUMN cleanup_state TEXT NOT NULL DEFAULT 'not_attempted'"
+            )
+        if "cleanup_error" not in patch_columns:
+            conn.execute("ALTER TABLE probe_patches ADD COLUMN cleanup_error TEXT")
+        if "apply_status" not in patch_columns:
+            conn.execute(
+                "ALTER TABLE probe_patches "
+                "ADD COLUMN apply_status TEXT NOT NULL DEFAULT 'not_applied'"
+            )
+        if "apply_error" not in patch_columns:
+            conn.execute("ALTER TABLE probe_patches ADD COLUMN apply_error TEXT")
+        if "applied_at" not in patch_columns:
+            conn.execute("ALTER TABLE probe_patches ADD COLUMN applied_at REAL")
+        if "applied_by_user_id" not in patch_columns:
+            conn.execute(
+                "ALTER TABLE probe_patches ADD COLUMN applied_by_user_id INTEGER"
+            )
+        experiment_columns = _columns(conn, "experiments")
+        if "human_decision_variant_key" not in experiment_columns:
+            conn.execute(
+                "ALTER TABLE experiments "
+                "ADD COLUMN human_decision_variant_key TEXT"
+            )
+        entrypoint_columns = _columns(conn, "code_entrypoints")
+        if "source" not in entrypoint_columns:
+            conn.execute(
+                "ALTER TABLE code_entrypoints "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT 'deterministic'"
+            )
+        if "pattern_id" not in entrypoint_columns:
+            conn.execute(
+                "ALTER TABLE code_entrypoints ADD COLUMN pattern_id INTEGER"
+            )
         _ensure_legacy_system(conn)
     _bootstrap_admin()
 
