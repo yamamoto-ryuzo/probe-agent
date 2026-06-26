@@ -335,6 +335,77 @@ class TestSourceMetadataAPI:
         )
         assert sym["source_metadata"]["capability"] == "execution-flow-understanding"
 
+    def test_backfill_upgrades_pre_54_index(self, admin_client, tmp_path):
+        from app.db import get_conn
+
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "MetaBackfill")
+        repo = _git_repo(tmp_path)
+        body = _index(admin_client, token, system["id"], repo)
+        snapshot_id = body["snapshot_id"]
+        flow_sym = next(
+            s for s in body["symbols"] if s["qualified_name"] == "build_flow_graph"
+        )
+        original_symbol_id = flow_sym["id"]
+
+        # Simulate a snapshot indexed before #54: symbols exist, but no source
+        # metadata and the run predates the metadata schema version.
+        with get_conn() as conn:
+            conn.execute(
+                "DELETE FROM symbol_source_metadata WHERE snapshot_id = ?",
+                (snapshot_id,),
+            )
+            conn.execute(
+                "DELETE FROM symbol_index_warnings WHERE snapshot_id = ? "
+                "AND message LIKE '%probe-agent metadata:%'",
+                (snapshot_id,),
+            )
+            conn.execute(
+                """
+                UPDATE intelligence_runs SET schema_version = 'legacy'
+                WHERE snapshot_id = ? AND run_type = 'symbol_index'
+                """,
+                (snapshot_id,),
+            )
+
+        h = _headers(token, system["id"])
+        # Re-running index triggers a deterministic, additive backfill.
+        r2 = admin_client.post("/repository/symbols/index", headers=h)
+        assert r2.status_code == 201
+        body2 = r2.json()
+        flow2 = next(
+            s for s in body2["symbols"] if s["qualified_name"] == "build_flow_graph"
+        )
+        # Symbols are preserved (same ids), metadata is now populated.
+        assert flow2["id"] == original_symbol_id
+        assert flow2["source_metadata"] is not None
+        assert flow2["source_metadata"]["element_type"] == "core"
+        assert body2["intelligence_run"]["schema_version"] == "metadata-v1"
+        warn_paths = [w["path"] for w in body2["warnings"]]
+        assert "src/bad.py" in warn_paths
+
+        # Idempotent: a third call does not duplicate metadata or warnings.
+        with get_conn() as conn:
+            meta_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM symbol_source_metadata WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()["c"]
+            warn_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()["c"]
+        r3 = admin_client.post("/repository/symbols/index", headers=h)
+        assert r3.status_code == 201
+        with get_conn() as conn:
+            assert meta_count == conn.execute(
+                "SELECT COUNT(*) AS c FROM symbol_source_metadata WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()["c"]
+            assert warn_count == conn.execute(
+                "SELECT COUNT(*) AS c FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()["c"]
+
     def test_metadata_is_system_scoped(self, admin_client, tmp_path):
         token = _login(admin_client)
         sys_a = _create_system(admin_client, token, "MetaA")

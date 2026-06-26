@@ -118,6 +118,32 @@
         "created_at": { "type": "number" }
       }
     },
+    "SourceMetadata": {
+      "type": "object",
+      "description": "Author-written, source-anchored explanation copied verbatim from a docstring probe-agent block. Kept separate from reasoning-model output; origin is always source_authored.",
+      "required": ["start_line", "end_line", "raw_block"],
+      "properties": {
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "raw_block": { "type": "string" },
+        "role": { "type": ["string", "null"] },
+        "capability": { "type": ["string", "null"] },
+        "element_type": {
+          "type": ["string", "null"],
+          "enum": ["system", "core", "capability", "element", "supporting", "boundary", null]
+        },
+        "system_purpose": { "type": ["string", "null"] },
+        "operation_kind": {
+          "type": ["string", "null"],
+          "enum": ["analysis", "read", "write", "mutation", "io", "orchestration", "validation", "other", null]
+        },
+        "consumers": { "type": "array", "items": { "type": "string" } },
+        "state_effects": { "type": "array", "items": { "type": "string" } },
+        "probe_value": { "type": ["string", "null"] },
+        "origin": { "enum": ["source_authored"] }
+      },
+      "additionalProperties": false
+    },
     "CodeSymbol": {
       "type": "object",
       "required": ["id", "snapshot_id", "system_id", "path", "qualified_name", "kind", "start_line", "end_line"],
@@ -137,7 +163,13 @@
         "is_pydantic_model": { "type": "boolean" },
         "route_path": { "type": ["string", "null"] },
         "route_method": { "type": ["string", "null"] },
-        "component_id": { "type": ["string", "null"] }
+        "component_id": { "type": ["string", "null"] },
+        "source_metadata": {
+          "oneOf": [
+            { "$ref": "#/definitions/SourceMetadata" },
+            { "type": "null" }
+          ]
+        }
       },
       "additionalProperties": false
     },

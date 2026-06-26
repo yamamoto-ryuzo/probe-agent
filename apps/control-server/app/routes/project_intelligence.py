@@ -840,6 +840,12 @@ def get_latest_drafts(
 # ---------------------------------------------------------------------------
 
 
+# Bumped when the deterministic symbol index gains new extracted facts so that
+# snapshots indexed by an older version can be deterministically upgraded
+# without re-creating code_symbols (which would cascade-delete feature links).
+SYMBOL_INDEX_SCHEMA_VERSION = "metadata-v1"
+
+
 def _metadata_out(row) -> SourceMetadataOut:
     return SourceMetadataOut(
         start_line=row["start_line"],
@@ -864,6 +870,112 @@ def _load_metadata_map(conn, snapshot_id: int) -> dict:
         (snapshot_id,),
     ).fetchall()
     return {r["symbol_id"]: _metadata_out(r) for r in rows}
+
+
+def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: int) -> None:
+    """Deterministically add #54 source metadata to a pre-existing index.
+
+    Snapshots indexed before source-metadata extraction existed keep their
+    ``code_symbols`` rows (so feature-code links are preserved) but have no
+    ``symbol_source_metadata``.  This re-parses the pinned snapshot files and
+    additively inserts metadata + metadata warnings, matching existing symbols
+    by ``(path, qualified_name)``.  It runs once, gated by the run's
+    ``schema_version``.
+    """
+    file_rows = conn.execute(
+        """
+        SELECT path, content FROM snapshot_files
+        WHERE snapshot_id = ? AND inclusion_status = 'indexed'
+        ORDER BY path
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    files = [(fr["path"], bytes(fr["content"] or b"")) for fr in file_rows]
+    result = index_snapshot_files(files)
+
+    sym_rows = conn.execute(
+        "SELECT id, path, qualified_name FROM code_symbols WHERE snapshot_id = ?",
+        (snapshot_id,),
+    ).fetchall()
+    id_by_key = {(r["path"], r["qualified_name"]): r["id"] for r in sym_rows}
+    existing_meta_symbol_ids = {
+        r["symbol_id"]
+        for r in conn.execute(
+            "SELECT symbol_id FROM symbol_source_metadata WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    }
+    existing_warnings = {
+        (w["path"], w["message"])
+        for w in conn.execute(
+            "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    }
+
+    conn.execute("BEGIN")
+    try:
+        for sym in result.symbols:
+            meta = sym.source_metadata
+            if meta is None:
+                continue
+            symbol_id = id_by_key.get((sym.path, sym.qualified_name))
+            if symbol_id is None or symbol_id in existing_meta_symbol_ids:
+                continue
+            conn.execute(
+                """
+                INSERT INTO symbol_source_metadata
+                    (snapshot_id, system_id, symbol_id, path, qualified_name,
+                     start_line, end_line, role, capability, element_type,
+                     system_purpose, operation_kind, consumers, state_effects,
+                     probe_value, raw_block, origin)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snapshot_id,
+                    system_id,
+                    symbol_id,
+                    sym.path,
+                    sym.qualified_name,
+                    meta.start_line,
+                    meta.end_line,
+                    meta.role,
+                    meta.capability,
+                    meta.element_type,
+                    meta.system_purpose,
+                    meta.operation_kind,
+                    json.dumps(meta.consumers),
+                    json.dumps(meta.state_effects),
+                    meta.probe_value,
+                    meta.raw_block,
+                    meta.origin,
+                ),
+            )
+
+        # Add only metadata warnings (syntax/decode warnings already exist from
+        # the original index); guard against duplicates so backfill is idempotent.
+        for warn in result.warnings:
+            if "probe-agent metadata:" not in warn.message:
+                continue
+            if (warn.path, warn.message) in existing_warnings:
+                continue
+            conn.execute(
+                """
+                INSERT INTO symbol_index_warnings
+                    (snapshot_id, system_id, path, message)
+                VALUES (?, ?, ?, ?)
+                """,
+                (snapshot_id, system_id, warn.path, warn.message),
+            )
+
+        conn.execute(
+            "UPDATE intelligence_runs SET schema_version = ? WHERE id = ?",
+            (SYMBOL_INDEX_SCHEMA_VERSION, run_id),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
 
 
 def _symbol_out(row, metadata: Optional[SourceMetadataOut] = None) -> CodeSymbolOut:
@@ -918,14 +1030,6 @@ def index_symbols_endpoint(
             (snapshot_id,),
         ).fetchone()
         if existing["cnt"] > 0:
-            sym_rows = conn.execute(
-                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
-                (snapshot_id,),
-            ).fetchall()
-            warn_rows = conn.execute(
-                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
-                (snapshot_id,),
-            ).fetchall()
             run_row = conn.execute(
                 """
                 SELECT * FROM intelligence_runs
@@ -934,6 +1038,25 @@ def index_symbols_endpoint(
                 """,
                 (system_id, snapshot_id),
             ).fetchone()
+            # Deterministically upgrade indexes created before #54 so their
+            # source metadata is populated without re-creating symbols.
+            if (
+                run_row is not None
+                and run_row["schema_version"] != SYMBOL_INDEX_SCHEMA_VERSION
+            ):
+                _backfill_source_metadata(conn, system_id, snapshot_id, run_row["id"])
+                run_row = conn.execute(
+                    "SELECT * FROM intelligence_runs WHERE id = ?",
+                    (run_row["id"],),
+                ).fetchone()
+            sym_rows = conn.execute(
+                "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
+                (snapshot_id,),
+            ).fetchall()
+            warn_rows = conn.execute(
+                "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchall()
             meta_map = _load_metadata_map(conn, snapshot_id)
             return SymbolIndexOut(
                 snapshot_id=snapshot_id,
@@ -973,10 +1096,10 @@ def index_symbols_endpoint(
                      prompt_version, schema_version, decision_method,
                      status, is_mock, started_at, completed_at)
                 VALUES (?, ?, 'symbol_index', 'deterministic', 'ast',
-                        'n/a', 'n/a', 'deterministic',
+                        'n/a', ?, 'deterministic',
                         'completed', 0, ?, ?)
                 """,
-                (system_id, snapshot_id, started_at, completed_at),
+                (system_id, snapshot_id, SYMBOL_INDEX_SCHEMA_VERSION, started_at, completed_at),
             )
             run_id = cur.lastrowid
 

@@ -194,6 +194,37 @@ export interface DraftGenerationResultOut {
   feature_drafts: FeatureDraftOut[];
 }
 
+export interface SourceMetadataOut {
+  start_line: number;
+  end_line: number;
+  raw_block: string;
+  role: string | null;
+  capability: string | null;
+  element_type:
+    | "system"
+    | "core"
+    | "capability"
+    | "element"
+    | "supporting"
+    | "boundary"
+    | null;
+  system_purpose: string | null;
+  operation_kind:
+    | "analysis"
+    | "read"
+    | "write"
+    | "mutation"
+    | "io"
+    | "orchestration"
+    | "validation"
+    | "other"
+    | null;
+  consumers: string[];
+  state_effects: string[];
+  probe_value: string | null;
+  origin: "source_authored";
+}
+
 export interface CodeSymbolOut {
   id: number;
   snapshot_id: number;
@@ -211,6 +242,7 @@ export interface CodeSymbolOut {
   route_path: string | null;
   route_method: string | null;
   component_id: string | null;
+  source_metadata: SourceMetadataOut | null;
 }
 
 export interface SymbolIndexOut {
