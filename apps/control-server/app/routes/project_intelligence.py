@@ -951,16 +951,16 @@ def index_symbols_endpoint(
             )
             run_id = cur.lastrowid
 
-            for sym in result.symbols:
-                conn.execute(
-                    """
-                    INSERT INTO code_symbols
-                        (snapshot_id, system_id, path, qualified_name, kind,
-                         start_line, end_line, decorators, imports, docstring,
-                         is_test, is_pydantic_model, route_path, route_method,
-                         component_id)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO code_symbols
+                    (snapshot_id, system_id, path, qualified_name, kind,
+                        start_line, end_line, decorators, imports, docstring,
+                        is_test, is_pydantic_model, route_path, route_method,
+                        component_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
                     (
                         snapshot_id,
                         system_id,
@@ -977,8 +977,10 @@ def index_symbols_endpoint(
                         sym.route_path,
                         sym.route_method,
                         sym.component_id,
-                    ),
-                )
+                    )
+                    for sym in result.symbols
+                ],
+            )
 
             for warn in result.warnings:
                 conn.execute(
