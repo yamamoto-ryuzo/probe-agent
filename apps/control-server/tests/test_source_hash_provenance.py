@@ -63,6 +63,44 @@ class TestSymbolHashing:
             == self._hashes(src)["foo"].symbol_source_hash
         )
 
+    def test_decorator_change_changes_source_hash(self):
+        a = self._hashes(
+            'from fastapi import APIRouter\n'
+            'router = APIRouter()\n'
+            '\n'
+            '@router.get("/a")\n'
+            'def foo():\n'
+            '    return 1\n'
+        )
+        b = self._hashes(
+            'from fastapi import APIRouter\n'
+            'router = APIRouter()\n'
+            '\n'
+            '@router.get("/b")\n'
+            'def foo():\n'
+            '    return 1\n'
+        )
+        # Editing the route decorator is part of the externally observable role
+        # and must change the exact source-span hash.
+        assert a["foo"].symbol_source_hash != b["foo"].symbol_source_hash
+        # The def line is unchanged; start_line stays on the def for display.
+        assert a["foo"].start_line == b["foo"].start_line
+
+    def test_comment_around_decorator_changes_source_hash_only(self):
+        a = self._hashes(
+            '@property\n'
+            'def foo(self):\n'
+            '    return 1\n'
+        )
+        commented = self._hashes(
+            '@property\n'
+            '# explain the decorator\n'
+            'def foo(self):\n'
+            '    return 1\n'
+        )
+        assert a["foo"].symbol_source_hash != commented["foo"].symbol_source_hash
+        assert a["foo"].symbol_body_hash == commented["foo"].symbol_body_hash
+
     def test_explanation_hash_present_and_sensitive(self):
         base = self._hashes(
             'def foo():\n'
@@ -323,3 +361,74 @@ class TestExplanationAnchorsAPI:
             "/repository/explanation-anchors", headers=_headers(token, sys_b["id"])
         )
         assert r_b.json()["anchor_count"] == 0
+
+
+def _degrade_to_pre_55_index(snapshot_id):
+    """Simulate a snapshot indexed before #55: clear hashes/metadata/anchors
+    and reset the run schema version so the upgrade gate fires."""
+    from app.db import get_conn
+
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE code_symbols SET symbol_source_hash = NULL, "
+            "symbol_body_hash = NULL WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        conn.execute(
+            "DELETE FROM symbol_source_metadata WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        conn.execute(
+            "DELETE FROM explanation_source_anchors WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+        conn.execute(
+            "DELETE FROM symbol_index_warnings WHERE snapshot_id = ? "
+            "AND message LIKE '%probe-agent metadata:%'",
+            (snapshot_id,),
+        )
+        conn.execute(
+            "UPDATE intelligence_runs SET schema_version = 'legacy' "
+            "WHERE snapshot_id = ? AND run_type = 'symbol_index'",
+            (snapshot_id,),
+        )
+
+
+class TestReadPathUpgrade:
+    def test_get_symbols_upgrades_stale_index(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "ReadUpgradeSym")
+        repo = _make_repo(tmp_path)
+        h = _headers(token, system["id"])
+        body = _configure_and_index(admin_client, token, system["id"], repo)
+        _degrade_to_pre_55_index(body["snapshot_id"])
+
+        # A plain GET (what the Dashboard uses) must surface hashes without an
+        # explicit re-index.
+        r = admin_client.get("/repository/symbols", headers=h)
+        assert r.status_code == 200
+        out = r.json()
+        flow = _by_name(out, "build_flow_graph")
+        assert flow["symbol_source_hash"] is not None
+        assert flow["symbol_body_hash"] is not None
+        assert flow["file_content_hash"] is not None
+        assert flow["source_metadata"] is not None
+        assert flow["source_metadata"]["explanation_hash"] is not None
+        assert out["intelligence_run"]["schema_version"] == "provenance-v1"
+
+    def test_get_anchors_upgrades_stale_index(self, admin_client, tmp_path):
+        token = _login(admin_client)
+        system = _create_system(admin_client, token, "ReadUpgradeAnc")
+        repo = _make_repo(tmp_path)
+        h = _headers(token, system["id"])
+        body = _configure_and_index(admin_client, token, system["id"], repo)
+        _degrade_to_pre_55_index(body["snapshot_id"])
+
+        r = admin_client.get("/repository/explanation-anchors", headers=h)
+        assert r.status_code == 200
+        out = r.json()
+        assert out["anchor_count"] == 1
+        anchor = out["anchors"][0]
+        assert anchor["qualified_name"] == "build_flow_graph"
+        assert anchor["symbol_source_hash"] is not None
+        assert anchor["explanation_hash"] is not None

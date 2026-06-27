@@ -1064,6 +1064,39 @@ def _backfill_source_metadata(conn, system_id: int, snapshot_id: int, run_id: in
         raise
 
 
+def _upgrade_index_if_stale(conn, system_id: int, snapshot_id: int):
+    """Deterministically upgrade a stale symbol index in place, if needed.
+
+    Returns the latest symbol_index run row (refreshed after any upgrade), or
+    ``None`` when the snapshot has not been indexed.  Idempotent and gated by
+    the run's ``schema_version`` so it is safe to call from read paths: existing
+    snapshots indexed by an older version are upgraded the first time they are
+    read instead of requiring an explicit re-index.  Mirrors the deterministic
+    INSERT-on-read pattern already used by flow-entrypoint discovery.
+    """
+    run_row = conn.execute(
+        """
+        SELECT * FROM intelligence_runs
+        WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (system_id, snapshot_id),
+    ).fetchone()
+    if run_row is None or run_row["schema_version"] == SYMBOL_INDEX_SCHEMA_VERSION:
+        return run_row
+    has_symbols = conn.execute(
+        "SELECT 1 FROM code_symbols WHERE snapshot_id = ? LIMIT 1",
+        (snapshot_id,),
+    ).fetchone()
+    if has_symbols is None:
+        return run_row
+    _backfill_source_metadata(conn, system_id, snapshot_id, run_row["id"])
+    return conn.execute(
+        "SELECT * FROM intelligence_runs WHERE id = ?",
+        (run_row["id"],),
+    ).fetchone()
+
+
 def _symbol_out(
     row,
     metadata: Optional[SourceMetadataOut] = None,
@@ -1123,25 +1156,10 @@ def index_symbols_endpoint(
             (snapshot_id,),
         ).fetchone()
         if existing["cnt"] > 0:
-            run_row = conn.execute(
-                """
-                SELECT * FROM intelligence_runs
-                WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
-                ORDER BY id DESC LIMIT 1
-                """,
-                (system_id, snapshot_id),
-            ).fetchone()
-            # Deterministically upgrade indexes created before #54 so their
-            # source metadata is populated without re-creating symbols.
-            if (
-                run_row is not None
-                and run_row["schema_version"] != SYMBOL_INDEX_SCHEMA_VERSION
-            ):
-                _backfill_source_metadata(conn, system_id, snapshot_id, run_row["id"])
-                run_row = conn.execute(
-                    "SELECT * FROM intelligence_runs WHERE id = ?",
-                    (run_row["id"],),
-                ).fetchone()
+            # Deterministically upgrade indexes created before #54/#55 so their
+            # source metadata and hashes are populated without re-creating
+            # symbols (which would cascade-delete feature links).
+            run_row = _upgrade_index_if_stale(conn, system_id, snapshot_id)
             sym_rows = conn.execute(
                 "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
                 (snapshot_id,),
@@ -1337,6 +1355,9 @@ def get_symbols(
             )
 
         snapshot_id = snapshot_row["id"]
+        # Upgrade pre-#55 indexes on read so Dashboard sees hashes/anchors
+        # without requiring an explicit re-index (deterministic, idempotent).
+        run_row = _upgrade_index_if_stale(conn, system_id, snapshot_id)
         sym_rows = conn.execute(
             "SELECT * FROM code_symbols WHERE snapshot_id = ? ORDER BY path, start_line",
             (snapshot_id,),
@@ -1345,14 +1366,6 @@ def get_symbols(
             "SELECT path, message FROM symbol_index_warnings WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchall()
-        run_row = conn.execute(
-            """
-            SELECT * FROM intelligence_runs
-            WHERE system_id = ? AND snapshot_id = ? AND run_type = 'symbol_index'
-            ORDER BY id DESC LIMIT 1
-            """,
-            (system_id, snapshot_id),
-        ).fetchone()
         meta_map = _load_metadata_map(conn, snapshot_id)
         file_hash_map = _load_file_hash_map(conn, snapshot_id)
 
@@ -1417,6 +1430,9 @@ def get_explanation_anchors(
                 system_id=system_id, snapshot_id=0, anchor_count=0,
             )
         snapshot_id = snapshot_row["id"]
+        # Upgrade pre-#55 indexes on read so anchors exist without an explicit
+        # re-index (deterministic, idempotent).
+        _upgrade_index_if_stale(conn, system_id, snapshot_id)
         rows = conn.execute(
             """
             SELECT * FROM explanation_source_anchors

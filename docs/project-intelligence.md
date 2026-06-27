@@ -445,7 +445,7 @@ snapshot のコミット済み内容からのみ**ハッシュと抽出コピー
 | ハッシュ | 対象 | 意味 | 変わる/変わらない |
 | --- | --- | --- | --- |
 | `file_content_hash` | ファイル | コミット済みファイル内容のハッシュ（snapshot が既に保持）。 | ファイル内のどの変更でも変わる。 |
-| `symbol_source_hash` | symbol | symbol の正確なソース span（signature + body, コミット時のまま）のハッシュ。 | コメント・docstring・空白を含む span 内のどの変更でも変わる。 |
+| `symbol_source_hash` | symbol | symbol の正確なソース span（decorator + signature + body, コミット時のまま）のハッシュ。decorator がある場合は span 開始を先頭 decorator 行にする（API entrypoint の `@router.get(...)` 等は外部から観測される役割の一部のため）。`start_line` は表示・下流の行範囲用に def/class 行のまま。 | decorator・コメント・docstring・空白を含む span 内のどの変更でも変わる。 |
 | `symbol_body_hash` | symbol | docstring を除去し `ast.dump`（属性なし）で正規化した構造のハッシュ。コメント・docstring・整形・行番号を**除外**。 | 構造的なコード変更でのみ変わる。コメント/docstring だけの変更では変わらない。 |
 | `explanation_hash` | 説明ブロック | #54 の抽出済み `probe-agent:` ブロック文字列のハッシュ。 | 説明文の変更で変わる。 |
 
@@ -478,9 +478,14 @@ docstring のみ変更で安定、実装変更で変化）。
 - `explanation_source_anchors`（system-scoped・追加のみの新規テーブル）に anchor
   集合を保存する。
 - symbol index run を `schema_version='provenance-v1'` でバージョン管理する。
-  #54/#55 以前に index 済みの snapshot を再 index すると、`code_symbols` を作り直さず
+  #54/#55 以前に index 済みの snapshot は、`code_symbols` を作り直さず
   （feature-code link を cascade 削除しないため）にハッシュ・メタデータ・anchor を
-  **決定的・追加のみ・冪等**にバックフィルする。
+  **決定的・追加のみ・冪等**にバックフィルする。アップグレードは
+  `POST /repository/symbols/index` だけでなく、**read 経路でも**実行する
+  （`GET /repository/symbols` / `GET /repository/explanation-anchors`）。
+  これにより Dashboard は明示的な再 index なしに古い snapshot のハッシュ／anchor を
+  得られる（flow-entrypoint discovery と同じ決定的 INSERT-on-read パターン）。
+  schema_version が一致した以降は再計算しない。
 - API: `GET /repository/symbols` と `POST /repository/symbols/index` の
   `CodeSymbolOut` に `file_content_hash` / `symbol_source_hash` /
   `symbol_body_hash` を、`SourceMetadataOut` に `explanation_hash` を公開する。

@@ -488,8 +488,16 @@ def index_python_file_full(path: str, source: str) -> FileIndexResult:
             )
 
     def _attach_hashes(node: ast.AST, symbol: CodeSymbol) -> None:
+        # Decorators are part of the callable's externally observable role
+        # (especially for API entrypoints), so the exact source span starts at
+        # the first decorator line when present. ``symbol.start_line`` stays on
+        # the def/class line for display and downstream line-range consumers.
+        span_start = symbol.start_line
+        decorators = getattr(node, "decorator_list", None)
+        if decorators:
+            span_start = min(span_start, min(d.lineno for d in decorators))
         symbol.symbol_source_hash = _symbol_source_hash(
-            source_lines, symbol.start_line, symbol.end_line
+            source_lines, span_start, symbol.end_line
         )
         symbol.symbol_body_hash = _symbol_body_hash(node)
 
