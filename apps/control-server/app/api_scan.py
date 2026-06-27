@@ -160,7 +160,7 @@ expression that matches one endpoint declaration per match.
 Rules:
 - Base every pattern on declaration syntax actually present in the samples.
 - Each regex should match a single endpoint declaration (typically one line).
-- Capture the URL path in a named group `(?P<path>...)`. If the HTTP method is
+- Capture the URL path in a named group `(?P<path>...)` and set `path_group` to that name. This is REQUIRED. If the HTTP method is
   part of the declaration, capture it in `(?P<method>...)`; otherwise set
   `method_constant` (e.g. "GET") or leave it null for "ANY".
 - `file_glob` must be a repository-relative glob (e.g. `app/routes/*.js`,
@@ -175,7 +175,7 @@ Respond with ONLY valid JSON matching this schema:
       "file_glob": "string",
       "regex": "string",
       "method_group": "string-or-null",
-      "path_group": "string-or-null",
+      "path_group": "string",
       "method_constant": "string-or-null",
       "framework": "string",
       "language": "string",
