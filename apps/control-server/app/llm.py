@@ -45,9 +45,9 @@ class LLMConfig:
             "mock": "mock",
         }.get(provider, "gpt-4o-mini")
         try:
-            timeout = float(os.getenv("LLM_TIMEOUT", "30"))
+            timeout = float(os.getenv("LLM_TIMEOUT", "120"))
         except ValueError:
-            timeout = 30.0
+            timeout = 120.0
         return cls(
             provider=provider,
             api_key=api_key,
