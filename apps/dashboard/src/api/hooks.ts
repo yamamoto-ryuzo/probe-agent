@@ -7,6 +7,7 @@ import type {
   DraftGenerationResultOut,
   SymbolIndexOut, FeatureCodeLinksOut, ProbePlansListOut, ApiScanResultOut,
   FlowEntrypointsOut, FlowGraphOut, FlowProbeSelection, ProbePlanOut,
+  ApiRoleCardsOut,
   ProbePatchOut, GenerationRun, ExperimentOut, MeResponse,
   EvaluationCriterion,
   SystemProfile,
@@ -341,6 +342,14 @@ export function useFlowEntrypoints(
         `/repository/flow-entrypoints${qs ? `?${qs}` : ""}`,
       );
     },
+    enabled: !!getSystemId(),
+  });
+}
+
+export function useApiRoleCards() {
+  return useQuery({
+    queryKey: sysKey("apiRoleCards"),
+    queryFn: () => api.get<ApiRoleCardsOut>("/repository/api-role-cards"),
     enabled: !!getSystemId(),
   });
 }

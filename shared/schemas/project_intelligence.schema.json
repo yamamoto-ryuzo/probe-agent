@@ -501,6 +501,65 @@
         "review_note": { "type": ["string", "null"] }
       },
       "additionalProperties": false
+    },
+    "ApiRoleCard": {
+      "type": "object",
+      "description": "Flow Explorer developer context for one backend entrypoint (Issue #58). Aggregates source-authored explanation (#54), hierarchy placement (#56), and drift (#57). Joins to FlowEntrypoint by (entrypoint_type, entrypoint_id).",
+      "required": ["entrypoint_type", "entrypoint_id", "label", "classification"],
+      "properties": {
+        "entrypoint_type": { "type": "string" },
+        "entrypoint_id": { "type": "string" },
+        "label": { "type": "string" },
+        "category": { "type": "string" },
+        "route_method": { "type": ["string", "null"] },
+        "route_path": { "type": ["string", "null"] },
+        "operation": { "type": ["string", "null"] },
+        "framework": { "type": ["string", "null"] },
+        "source": { "type": "string" },
+        "handler_resolved": { "type": "boolean" },
+        "classification": { "enum": ["classified", "unclassified", "unknown"] },
+        "capability_key": { "type": ["string", "null"] },
+        "capability_name": { "type": ["string", "null"] },
+        "element_type": { "type": ["string", "null"] },
+        "role": { "type": ["string", "null"] },
+        "operation_kind": { "type": ["string", "null"] },
+        "probe_value": { "type": ["string", "null"] },
+        "consumers": { "type": "array", "items": { "type": "string" } },
+        "state_effects": { "type": "array", "items": { "type": "string" } },
+        "boundaries": { "type": "array", "items": { "type": "string" } },
+        "flows_through": { "type": "array", "items": { "type": "string" } },
+        "provenance_kinds": {
+          "type": "array",
+          "items": { "enum": ["source_authored", "structural", "reasoning_llm", "manual"] }
+        },
+        "drift_status": {
+          "oneOf": [
+            { "enum": ["fresh", "partially_stale", "stale", "missing_source", "unknown"] },
+            { "type": "null" }
+          ]
+        },
+        "drift_changed_anchors": { "type": "integer" },
+        "drift_total_anchors": { "type": "integer" },
+        "drift_review_recommended": { "type": "boolean" },
+        "review_needed": { "type": "boolean" },
+        "review_reason": { "type": ["string", "null"] },
+        "node_id": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    "ApiRoleCards": {
+      "type": "object",
+      "required": ["system_id"],
+      "properties": {
+        "system_id": { "type": "integer" },
+        "snapshot_id": { "type": ["integer", "null"] },
+        "hierarchy_run": { "oneOf": [{ "$ref": "#/definitions/IntelligenceRun" }, { "type": "null" }] },
+        "base_snapshot_id": { "type": ["integer", "null"] },
+        "target_snapshot_id": { "type": ["integer", "null"] },
+        "drift_available": { "type": "boolean" },
+        "cards": { "type": "array", "items": { "$ref": "#/definitions/ApiRoleCard" } }
+      },
+      "additionalProperties": false
     }
   },
   "type": "object"

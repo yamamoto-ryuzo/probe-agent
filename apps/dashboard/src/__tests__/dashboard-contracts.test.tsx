@@ -727,6 +727,105 @@ describe("Flow Explorer page", () => {
     });
     expect(await screen.findByText("1 of 2 entrypoint(s)")).toBeInTheDocument();
   });
+
+  function roleCard(overrides: Record<string, unknown> = {}) {
+    return {
+      entrypoint_type: "http_route", entrypoint_id: "POST:/documents/analyze",
+      label: "POST /documents/analyze", category: "api", route_method: "POST",
+      route_path: "/documents/analyze", operation: "POST /documents/analyze",
+      framework: "fastapi", source: "deterministic", handler_resolved: true,
+      classification: "classified", capability_key: "doc-analysis",
+      capability_name: "Document Analysis", element_type: "core",
+      role: "Analyzes uploaded documents", operation_kind: "analysis",
+      probe_value: "validate graph shape", consumers: ["dashboard"],
+      state_effects: ["database-read"], boundaries: ["database"],
+      flows_through: ["parse_blocks"],
+      provenance_kinds: ["source_authored", "structural"],
+      drift_status: "partially_stale", drift_changed_anchors: 2,
+      drift_total_anchors: 8, drift_review_recommended: true,
+      review_needed: false, review_reason: null, node_id: 9,
+      ...overrides,
+    };
+  }
+
+  test("shows a classified API role card with provenance and freshness", async () => {
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [flowGraph.entrypoint],
+        }));
+      }
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: 5, target_snapshot_id: 5, drift_available: true,
+          cards: [roleCard()],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockImplementation((path: string) =>
+      path === "/repository/flow-graphs" ? Promise.resolve(flowGraph) : Promise.resolve(null));
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("POST /documents/analyze"));
+
+    expect(await screen.findByTestId("api-role-card")).toBeInTheDocument();
+    expect(screen.getByText("Document Analysis")).toBeInTheDocument();
+    expect(screen.getByText("Analyzes uploaded documents")).toBeInTheDocument();
+    expect(screen.getByText("source-authored")).toBeInTheDocument();
+    expect(screen.getByText("partially stale")).toBeInTheDocument();
+    expect(screen.getByText(/2 of 8 source\s+anchors changed/)).toBeInTheDocument();
+  });
+
+  test("shows empty state for unclassified and review flag for LLM scan", async () => {
+    const unclassified = {
+      ...flowGraph.entrypoint,
+      entrypoint_id: "GET:/raw", label: "GET /raw", route_method: "GET",
+      route_path: "/raw", operation: "GET /raw", source: "reasoning_llm",
+    };
+    mockApi.get.mockImplementation((path: string) => {
+      if (path === "/repository/flow-entrypoints") {
+        return Promise.resolve(entrypointsResponse({
+          total: 1, entrypoints: [unclassified],
+        }));
+      }
+      if (path === "/repository/api-role-cards") {
+        return Promise.resolve({
+          system_id: 1, snapshot_id: 5, hierarchy_run: null,
+          base_snapshot_id: null, target_snapshot_id: null, drift_available: false,
+          cards: [roleCard({
+            entrypoint_type: "http_route", entrypoint_id: "GET:/raw",
+            label: "GET /raw", route_method: "GET", source: "reasoning_llm",
+            classification: "unclassified", capability_key: null,
+            capability_name: null, element_type: null, role: null,
+            operation_kind: null, probe_value: null, consumers: [],
+            state_effects: [], boundaries: [], flows_through: [],
+            provenance_kinds: ["structural"], drift_status: null,
+            drift_changed_anchors: 0, drift_total_anchors: 0,
+            handler_resolved: false, review_needed: true,
+            review_reason: "LLM-derived API definition without a resolved handler.",
+            node_id: null,
+          })],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApi.post.mockResolvedValue(flowGraph);
+
+    const { default: FlowExplorerPage } = await import("@/pages/flow-explorer");
+    render(<FlowExplorerPage />, { wrapper: createWrapper() });
+
+    fireEvent.click(await screen.findByText("GET /raw"));
+
+    expect(await screen.findByTestId("api-role-card")).toBeInTheDocument();
+    expect(screen.getByText(/No source-authored explanation yet/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/LLM-derived API definition without a resolved handler/),
+    ).toBeInTheDocument();
+  });
 });
 
 // ── Decision Workspace tests ────────────────────────────────────────

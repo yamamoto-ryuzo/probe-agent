@@ -413,6 +413,49 @@ export interface CapabilityHierarchyDriftOut {
   review_note: string | null;
 }
 
+// API role cards (Issue #58) — Flow Explorer developer context.
+export interface ApiRoleCardOut {
+  entrypoint_type: string;
+  entrypoint_id: string;
+  label: string;
+  category: string;
+  route_method: string | null;
+  route_path: string | null;
+  operation: string | null;
+  framework: string | null;
+  source: string;
+  handler_resolved: boolean;
+  classification: "classified" | "unclassified" | "unknown";
+  capability_key: string | null;
+  capability_name: string | null;
+  element_type: string | null;
+  role: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  consumers: string[];
+  state_effects: string[];
+  boundaries: string[];
+  flows_through: string[];
+  provenance_kinds: HierarchyProvenanceKind[];
+  drift_status: DriftStatus | null;
+  drift_changed_anchors: number;
+  drift_total_anchors: number;
+  drift_review_recommended: boolean;
+  review_needed: boolean;
+  review_reason: string | null;
+  node_id: number | null;
+}
+
+export interface ApiRoleCardsOut {
+  system_id: number;
+  snapshot_id: number | null;
+  hierarchy_run: IntelligenceRunOut | null;
+  base_snapshot_id: number | null;
+  target_snapshot_id: number | null;
+  drift_available: boolean;
+  cards: ApiRoleCardOut[];
+}
+
 export interface SymbolIndexOut {
   snapshot_id: number | null;
   system_id: number;

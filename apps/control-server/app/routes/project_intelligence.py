@@ -70,6 +70,8 @@ from ..models import (
     CapabilityDriftOut,
     CapabilityHierarchyDriftOut,
     DriftCountsOut,
+    ApiRoleCardOut,
+    ApiRoleCardsOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -2131,6 +2133,256 @@ def get_capability_hierarchy_drift(
             drift_service.REVIEW_NOTE
             if drift_service.is_review_recommended(system_status) else None
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# API role cards (Issue #58) — Flow Explorer developer context
+# ---------------------------------------------------------------------------
+
+_BACKEND_CATEGORIES = ("api", "message_queue", "scheduled_job", "cli")
+
+_BOUNDARY_LABELS = {
+    "database-read": "database",
+    "database-write": "database",
+    "network": "external HTTP",
+    "external-api": "external HTTP",
+    "filesystem": "filesystem",
+    "cache": "cache",
+    "queue": "queue",
+}
+
+
+def _boundaries_for(state_effects: List[str]) -> List[str]:
+    out: List[str] = []
+    for effect in state_effects:
+        label = _BOUNDARY_LABELS.get(effect)
+        if label and label not in out:
+            out.append(label)
+    return out
+
+
+@router.get(
+    "/repository/api-role-cards",
+    response_model=ApiRoleCardsOut,
+)
+def get_api_role_cards(
+    system_id: int = Depends(get_system_id),
+) -> ApiRoleCardsOut:
+    """Role cards for backend entrypoints, for Flow Explorer.
+
+    Aggregates each backend entrypoint's source-authored explanation (#54), its
+    place in the capability hierarchy (#56), and explanation drift (#57) into a
+    developer-facing card. Invents no new hierarchy semantics; degrades to a
+    clear unclassified/unknown state when context is missing.
+    """
+    with get_conn() as conn:
+        snapshot_row = _latest_ready_snapshot(conn, system_id)
+        if snapshot_row is None:
+            return ApiRoleCardsOut(system_id=system_id)
+        snapshot_id = snapshot_row["id"]
+        has_symbols = conn.execute(
+            "SELECT 1 FROM code_symbols WHERE snapshot_id = ? AND system_id = ? LIMIT 1",
+            (snapshot_id, system_id),
+        ).fetchone()
+    if has_symbols is None:
+        return ApiRoleCardsOut(system_id=system_id, snapshot_id=snapshot_id)
+
+    # Deterministic entrypoint discovery (idempotent persistence).
+    snapshot_row, flow_symbols, files = _load_flow_inputs(system_id)
+    snapshot_id = snapshot_row["id"]
+    _ensure_entrypoints_indexed(system_id, snapshot_row, flow_symbols, files)
+
+    with get_conn() as conn:
+        ep_rows = conn.execute(
+            "SELECT * FROM code_entrypoints WHERE snapshot_id = ? AND system_id = ?",
+            (snapshot_id, system_id),
+        ).fetchall()
+        meta_rows = conn.execute(
+            """
+            SELECT symbol_id, role, capability, element_type, operation_kind,
+                   consumers, state_effects, probe_value
+            FROM symbol_source_metadata WHERE snapshot_id = ? AND system_id = ?
+            """,
+            (snapshot_id, system_id),
+        ).fetchall()
+        meta_by_symbol = {r["symbol_id"]: r for r in meta_rows}
+
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND run_type = 'capability_hierarchy'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+
+        node_by_logical: dict = {}
+        cap_by_id: dict = {}
+        children_by_cap: dict = {}
+        drift_by_node: dict = {}
+        cap_drift: dict = {}
+        base_snapshot_id = None
+        target_snapshot_id = None
+        drift_available = False
+
+        if run_row is not None:
+            base_snapshot_id = run_row["snapshot_id"]
+            node_rows = conn.execute(
+                "SELECT * FROM capability_hierarchy_nodes WHERE intelligence_run_id = ? "
+                "ORDER BY id",
+                (run_row["id"],),
+            ).fetchall()
+            # Hierarchy nodes reference the base snapshot's code_entrypoints row
+            # ids, which are not stable across snapshots. Translate them to the
+            # logical (entrypoint_type, entrypoint_id) so the current snapshot's
+            # entrypoints can be joined to their hierarchy node.
+            base_ep_rows = conn.execute(
+                "SELECT id, entrypoint_type, entrypoint_id FROM code_entrypoints "
+                "WHERE snapshot_id = ? AND system_id = ?",
+                (base_snapshot_id, system_id),
+            ).fetchall()
+            logical_by_dbid = {
+                r["id"]: (r["entrypoint_type"], r["entrypoint_id"])
+                for r in base_ep_rows
+            }
+            for r in node_rows:
+                if r["node_type"] == "capability":
+                    cap_by_id[r["id"]] = r
+                if r["parent_id"] is not None:
+                    children_by_cap.setdefault(r["parent_id"], []).append(r)
+                if r["entrypoint_id"] is not None:
+                    logical = logical_by_dbid.get(r["entrypoint_id"])
+                    if logical is not None:
+                        node_by_logical[logical] = r
+
+            # Drift against the latest symbol-indexed snapshot (#57 semantics).
+            target_row = _latest_indexed_ready_snapshot(conn, system_id)
+            if target_row is not None:
+                target_snapshot_id = target_row["id"]
+                drift_available = True
+                facts = _snapshot_facts(conn, target_snapshot_id, system_id)
+                for r in node_rows:
+                    drift_by_node[r["id"]] = drift_service.compute_anchor_drift(
+                        _node_anchor(r), facts
+                    )
+                for cap_id, cap_row in cap_by_id.items():
+                    members = [drift_by_node[cap_id]] + [
+                        drift_by_node[c["id"]] for c in children_by_cap.get(cap_id, [])
+                    ]
+                    cap_drift[cap_id] = drift_service.aggregate_drift(members)
+
+    cards: List[ApiRoleCardOut] = []
+    for ep in ep_rows:
+        if ep["category"] not in _BACKEND_CATEGORIES:
+            continue
+        handler_resolved = ep["handler_symbol_id"] is not None
+        meta = meta_by_symbol.get(ep["handler_symbol_id"]) if handler_resolved else None
+        node = node_by_logical.get((ep["entrypoint_type"], ep["entrypoint_id"]))
+
+        # Classification: prefer the hierarchy node (reflects reasoning grouping);
+        # fall back to handler metadata.
+        classification = "unclassified"
+        capability_key = None
+        provenance_kinds: List[str] = ["structural"]
+        if node is not None:
+            classification = node["classification"] or "unclassified"
+            capability_key = node["capability_key"]
+            if node["provenance_kind"] == "reasoning_llm":
+                provenance_kinds = ["reasoning_llm", "structural"]
+        elif meta is not None and meta["capability"]:
+            classification = "classified"
+            capability_key = meta["capability"]
+        if meta is not None and meta["capability"]:
+            if "source_authored" not in provenance_kinds:
+                provenance_kinds = ["source_authored"] + provenance_kinds
+        if classification != "classified":
+            capability_key = None
+
+        capability_name = None
+        flows_through: List[str] = []
+        if capability_key is not None and node is not None and node["parent_id"]:
+            cap_row = cap_by_id.get(node["parent_id"])
+            if cap_row is not None:
+                capability_name = cap_row["name"]
+                flows_through = [
+                    c["name"] for c in children_by_cap.get(cap_row["id"], [])
+                    if c["node_type"] == "element" and c["id"] != node["id"]
+                ]
+        if capability_name is None and capability_key is not None:
+            capability_name = capability_key
+
+        state_effects = (
+            json.loads(meta["state_effects"]) if meta and meta["state_effects"] else []
+        )
+        consumers = json.loads(meta["consumers"]) if meta and meta["consumers"] else []
+
+        # Drift: capability aggregate for classified, node-level otherwise.
+        drift_status = None
+        changed = 0
+        total = 0
+        if drift_available and node is not None:
+            if classification == "classified" and node["parent_id"] in cap_drift:
+                status, counts = cap_drift[node["parent_id"]]
+                drift_status = status
+                changed = counts.stale + counts.missing
+                total = counts.fresh + counts.stale + counts.missing
+            elif node["id"] in drift_by_node:
+                d = drift_by_node[node["id"]]
+                drift_status = d.status
+                changed = 1 if d.status in ("stale", "missing_source") else 0
+                total = 1 if d.status != "unknown" else 0
+
+        # The card needs attention itself when an LLM-scan entry has no handler:
+        # an executable flow graph cannot be built and the role is unverified.
+        review_needed = ep["source"] == "reasoning_llm" and not handler_resolved
+        review_reason = (
+            "LLM-derived API definition without a resolved handler; an executable "
+            "flow graph is not supported and the role is unverified."
+            if review_needed else None
+        )
+
+        cards.append(ApiRoleCardOut(
+            entrypoint_type=ep["entrypoint_type"],
+            entrypoint_id=ep["entrypoint_id"],
+            label=ep["label"],
+            category=ep["category"],
+            route_method=ep["route_method"],
+            route_path=ep["route_path"],
+            operation=ep["operation"],
+            framework=ep["framework"],
+            source=ep["source"],
+            handler_resolved=handler_resolved,
+            classification=classification,
+            capability_key=capability_key,
+            capability_name=capability_name,
+            element_type=meta["element_type"] if meta else None,
+            role=meta["role"] if meta else None,
+            operation_kind=meta["operation_kind"] if meta else None,
+            probe_value=meta["probe_value"] if meta else None,
+            consumers=consumers,
+            state_effects=state_effects,
+            boundaries=_boundaries_for(state_effects),
+            flows_through=flows_through,
+            provenance_kinds=provenance_kinds,
+            drift_status=drift_status,
+            drift_changed_anchors=changed,
+            drift_total_anchors=total,
+            drift_review_recommended=drift_service.is_review_recommended(drift_status or ""),
+            review_needed=review_needed,
+            review_reason=review_reason,
+            node_id=node["id"] if node is not None else None,
+        ))
+
+    cards.sort(key=lambda c: (c.category, c.label))
+    return ApiRoleCardsOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        hierarchy_run=_intelligence_run_out(run_row) if run_row else None,
+        base_snapshot_id=base_snapshot_id,
+        target_snapshot_id=target_snapshot_id,
+        drift_available=drift_available,
+        cards=cards,
     )
 
 

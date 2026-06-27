@@ -996,6 +996,64 @@ class FlowEntrypointsOut(BaseModel):
     diagnostics: List[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# API role cards (Issue #58) — Flow Explorer developer context.
+# Consumes the #56 capability hierarchy and #57 drift; invents no new semantics.
+# ---------------------------------------------------------------------------
+
+
+class ApiRoleCardOut(BaseModel):
+    # Identity: joins to FlowEntrypointOut by (entrypoint_type, entrypoint_id).
+    entrypoint_type: str
+    entrypoint_id: str
+    label: str
+    category: FlowEntrypointCategory = "function"
+    route_method: Optional[str] = None
+    route_path: Optional[str] = None
+    operation: Optional[str] = None
+    framework: Optional[str] = None
+    source: str = "deterministic"  # deterministic (AST) | reasoning_llm (scan)
+    # Whether a handler symbol resolved -> whether an executable flow graph is
+    # supported. LLM-scan entries without a handler must not imply graph support.
+    handler_resolved: bool = False
+    classification: Literal["classified", "unclassified", "unknown"] = "unknown"
+    capability_key: Optional[str] = None
+    capability_name: Optional[str] = None
+    element_type: Optional[str] = None  # core | element | supporting (from #54)
+    role: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    consumers: List[str] = Field(default_factory=list)
+    state_effects: List[str] = Field(default_factory=list)
+    boundaries: List[str] = Field(default_factory=list)
+    flows_through: List[str] = Field(default_factory=list)
+    # Distinct provenance kinds backing the card, e.g. ["source_authored",
+    # "structural"] or ["reasoning_llm", "structural"].
+    provenance_kinds: List[ProvenanceKind] = Field(default_factory=list)
+    # Drift (#57). Capability-level for classified cards, node-level otherwise.
+    drift_status: Optional[
+        Literal["fresh", "partially_stale", "stale", "missing_source", "unknown"]
+    ] = None
+    drift_changed_anchors: int = 0
+    drift_total_anchors: int = 0
+    drift_review_recommended: bool = False
+    # Review attention for the card itself (distinct from freshness): set when
+    # an LLM-scan entry has no resolved handler/flow.
+    review_needed: bool = False
+    review_reason: Optional[str] = None
+    node_id: Optional[int] = None
+
+
+class ApiRoleCardsOut(BaseModel):
+    system_id: int
+    snapshot_id: Optional[int] = None
+    hierarchy_run: Optional[IntelligenceRunOut] = None
+    base_snapshot_id: Optional[int] = None
+    target_snapshot_id: Optional[int] = None
+    drift_available: bool = False
+    cards: List[ApiRoleCardOut] = Field(default_factory=list)
+
+
 class ApiScanRequest(BaseModel):
     snapshot_id: Optional[int] = None
     commit_sha: Optional[str] = None
