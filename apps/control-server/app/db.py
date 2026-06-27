@@ -447,6 +447,55 @@ CREATE INDEX IF NOT EXISTS idx_explanation_anchors_snapshot
 CREATE INDEX IF NOT EXISTS idx_explanation_anchors_system
     ON explanation_source_anchors (system_id, snapshot_id);
 
+-- Source-backed capability hierarchy (Issue #56). One row per hierarchy node,
+-- discriminated by node_type (purpose|capability|element|supporting) and linked
+-- to its parent via parent_id. Each node records its provenance (source anchor,
+-- hashes, provenance_kind, decision_method, provider/model) so source-authored
+-- explanation, deterministic structural fact, and reasoning interpretation stay
+-- separable. Scoped by system and repository snapshot.
+CREATE TABLE IF NOT EXISTS capability_hierarchy_nodes (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    system_id               INTEGER NOT NULL,
+    snapshot_id             INTEGER NOT NULL,
+    intelligence_run_id     INTEGER NOT NULL,
+    parent_id               INTEGER,
+    node_type               TEXT NOT NULL,
+    name                    TEXT NOT NULL DEFAULT '',
+    summary                 TEXT NOT NULL DEFAULT '',
+    capability_key          TEXT,
+    element_role            TEXT,
+    operation_kind          TEXT,
+    probe_value             TEXT,
+    supporting_kind         TEXT,
+    classification          TEXT,
+    symbol_id               INTEGER,
+    entrypoint_id           INTEGER,
+    feature_id              TEXT,
+    system_profile_draft_id INTEGER,
+    path                    TEXT,
+    qualified_name          TEXT,
+    start_line              INTEGER,
+    end_line                INTEGER,
+    file_content_hash       TEXT,
+    symbol_source_hash      TEXT,
+    explanation_hash        TEXT,
+    provenance_kind         TEXT NOT NULL DEFAULT 'structural',
+    decision_method         TEXT NOT NULL DEFAULT 'deterministic',
+    provider                TEXT,
+    model                   TEXT,
+    created_at              REAL NOT NULL,
+    FOREIGN KEY (system_id) REFERENCES systems (id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES repository_snapshots (id) ON DELETE CASCADE,
+    FOREIGN KEY (intelligence_run_id) REFERENCES intelligence_runs (id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES capability_hierarchy_nodes (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_run
+    ON capability_hierarchy_nodes (intelligence_run_id);
+
+CREATE INDEX IF NOT EXISTS idx_capability_hierarchy_system
+    ON capability_hierarchy_nodes (system_id, snapshot_id);
+
 CREATE TABLE IF NOT EXISTS code_entrypoints (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
     system_id               INTEGER NOT NULL,

@@ -491,6 +491,77 @@ docstring のみ変更で安定、実装変更で変化）。
   `symbol_body_hash` を、`SourceMetadataOut` に `explanation_hash` を公開する。
   `GET /repository/explanation-anchors` で anchor 集合を返す。
 
+## ソース由来の能力階層（Issue #56）
+
+System Profile / Feature Map draft と Flow Explorer の backend entrypoint に加え、
+開発者が「このシステムは何のためにあり、どの中核能力が価値を生み、各能力をどの
+実装要素が構成し、どの API/job/queue/file/外部境界が補助要素か」を理解するための
+**ソース由来の能力階層**を追加する。#54 のソース由来説明メタデータと #55 のハッシュ
+来歴を監査可能な土台として保つ。
+
+```text
+System Purpose
+  Core Capability
+    Capability Element  -> source symbol / API entrypoint
+    Supporting Element  -> DB / filesystem / external HTTP / queue / scheduled job / CLI
+```
+
+### 構築方針（決定的優先・fail closed）
+
+- **決定的ビルダー**は #54 の著者記述 `capability` フィールドだけで group 化し、
+  自由文からは推測しない。`capability` を持たない symbol / API entrypoint は
+  推測せず `unclassified` にする。
+- **System Purpose**: module の `system_purpose` メタデータ（source_authored）を
+  優先し、無ければ最新 System Profile draft を構造的に link する（structural）。
+- **Capability Element**: `capability` を持つ symbol。`element_type` core/element
+  は capability element、supporting/boundary は supporting element。
+- **Supporting Element**: `state_effects`（database/filesystem/external-http/
+  cache/queue）や、message_queue/scheduled_job/cli の backend entrypoint。
+- **API entrypoint**: handler symbol が `capability` を持てば該当 capability の
+  element として classified、無ければ `unclassified`。
+- **reasoning model** は「unclassified な API entrypoint を既存 capability に
+  振り分ける」open-ended grouping だけに使う。非 reasoning model・API 失敗・
+  構造化出力の検証失敗は **fail closed**（heuristic fallback なし、run を failed に
+  記録）。決定的な source-authored 事実は failed でも保持する。
+
+### provenance と decision method
+
+各ノードは由来を明示する。CLAUDE.md 原則 7 に従い `decision_method` は
+`deterministic`/`reasoning_llm`/`manual` のいずれかに限定し、由来の区別は別フィールド
+`provenance_kind` で表す:
+
+| provenance_kind | 意味 | decision_method |
+| --- | --- | --- |
+| `source_authored` | #54 著者記述の説明から決定的に抽出 | `deterministic` |
+| `structural` | 決定的な構造事実（entrypoint 境界、draft link 等） | `deterministic` |
+| `reasoning_llm` | reasoning model による grouping 解釈 | `reasoning_llm` |
+| `manual` | 将来の手動上書き（本 issue 未実装） | `manual` |
+
+各ノードは source anchor（path/symbol/行範囲）と #55 のハッシュ
+（file_content_hash/symbol_source_hash/explanation_hash）、reasoning 使用時は
+provider/model も持つ。
+
+### 永続化と API
+
+- `capability_hierarchy_nodes`（system + snapshot scoped・新規テーブル）に
+  `node_type`（purpose/capability/element/supporting）と `parent_id` で階層を保存。
+  各 hierarchy run は `intelligence_runs(run_type='capability_hierarchy')` として
+  監査記録する（reasoning 使用時は decision_method=reasoning_llm、provider/model/
+  status/error を保存）。
+- `POST /repository/capability-hierarchy/generate?use_reasoning=true|false` で生成、
+  `GET /repository/capability-hierarchy` で最新階層を取得する。
+
+### 既存概念との関係
+
+- **System Profile / Feature Map draft（#23）** は reasoning model が生成する
+  「外から見たシステム/機能」の draft。能力階層はこれを置き換えず、purpose の
+  fallback ソースとして link するだけ（既存 Feature Map の挙動は変更しない）。
+- **FeatureCodeLink（#24）** は Feature draft と code symbol の reasoning による
+  対応付け。能力階層は **source-authored メタデータ起点**で symbol/entrypoint を
+  capability に構成する点が異なり、決定的事実と reasoning 解釈を `provenance_kind`
+  で分離する。両者は補完的で、後続の API role card・probe 選択コンテキスト・
+  refresh 推奨の意味層となる。
+
 ## リポジトリ設定案
 
 設定例は [`probe-agent.example.yml`](../probe-agent.example.yml) を参照する。

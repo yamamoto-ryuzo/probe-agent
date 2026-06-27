@@ -274,6 +274,78 @@ export interface ExplanationAnchorsOut {
   anchors: ExplanationAnchorOut[];
 }
 
+// Source-backed capability hierarchy (Issue #56).
+export type HierarchyProvenanceKind =
+  | "source_authored"
+  | "structural"
+  | "reasoning_llm"
+  | "manual";
+
+export interface HierarchyProvenanceOut {
+  provenance_kind: HierarchyProvenanceKind;
+  decision_method: "deterministic" | "reasoning_llm" | "manual";
+  path: string | null;
+  qualified_name: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  file_content_hash: string | null;
+  symbol_source_hash: string | null;
+  explanation_hash: string | null;
+  symbol_id: number | null;
+  entrypoint_id: number | null;
+  feature_id: string | null;
+  system_profile_draft_id: number | null;
+  provider: string | null;
+  model: string | null;
+}
+
+export interface SupportingElementOut {
+  id: number;
+  name: string;
+  summary: string;
+  supporting_kind: string | null;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityElementOut {
+  id: number;
+  name: string;
+  summary: string;
+  element_role: string | null;
+  operation_kind: string | null;
+  probe_value: string | null;
+  classification: "classified" | "unclassified" | null;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityOut {
+  id: number;
+  capability_key: string | null;
+  name: string;
+  summary: string;
+  provenance: HierarchyProvenanceOut;
+  elements: CapabilityElementOut[];
+  supporting_elements: SupportingElementOut[];
+}
+
+export interface CapabilityPurposeOut {
+  id: number;
+  name: string;
+  summary: string;
+  provenance: HierarchyProvenanceOut;
+}
+
+export interface CapabilityHierarchyOut {
+  system_id: number;
+  snapshot_id: number;
+  intelligence_run: IntelligenceRunOut | null;
+  purpose: CapabilityPurposeOut | null;
+  capabilities: CapabilityOut[];
+  unclassified_elements: CapabilityElementOut[];
+  unattached_supporting: SupportingElementOut[];
+  is_mock: boolean;
+}
+
 export interface SymbolIndexOut {
   snapshot_id: number | null;
   system_id: number;

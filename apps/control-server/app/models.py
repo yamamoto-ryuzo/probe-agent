@@ -216,8 +216,13 @@ IntelligenceRunType = Literal[
     "feature_code_mapping",
     "probe_plan",
     "probe_plan_from_flow",
+    "capability_hierarchy",
 ]
 DecisionMethod = Literal["deterministic", "reasoning_llm", "manual"]
+# How a single hierarchy claim was produced. Kept distinct from the audit
+# DecisionMethod so source-authored facts stay visibly separate from
+# reasoning-model interpretations (Issue #56).
+ProvenanceKind = Literal["source_authored", "structural", "reasoning_llm", "manual"]
 
 
 class RepositoryConfigUpdate(BaseModel):
@@ -602,6 +607,83 @@ class ExplanationAnchorsOut(BaseModel):
     snapshot_id: int
     anchor_count: int
     anchors: List[ExplanationAnchorOut] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Source-backed capability hierarchy (Issue #56)
+# ---------------------------------------------------------------------------
+
+
+class HierarchyProvenanceOut(BaseModel):
+    """Provenance for a single hierarchy claim.
+
+    ``provenance_kind`` distinguishes source-authored explanation, deterministic
+    structural fact, and reasoning-model interpretation. ``decision_method`` is
+    the audit enum. Hashes tie the claim to the pinned snapshot (#55).
+    """
+
+    provenance_kind: ProvenanceKind
+    decision_method: DecisionMethod
+    path: Optional[str] = None
+    qualified_name: Optional[str] = None
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
+    file_content_hash: Optional[str] = None
+    symbol_source_hash: Optional[str] = None
+    explanation_hash: Optional[str] = None
+    symbol_id: Optional[int] = None
+    entrypoint_id: Optional[int] = None
+    feature_id: Optional[str] = None
+    system_profile_draft_id: Optional[int] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+
+
+class SupportingElementOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    supporting_kind: Optional[str] = None
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityElementOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    element_role: Optional[str] = None
+    operation_kind: Optional[str] = None
+    probe_value: Optional[str] = None
+    classification: Optional[str] = None  # classified | unclassified
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityOut(BaseModel):
+    id: int
+    capability_key: Optional[str] = None
+    name: str
+    summary: str = ""
+    provenance: HierarchyProvenanceOut
+    elements: List[CapabilityElementOut] = Field(default_factory=list)
+    supporting_elements: List[SupportingElementOut] = Field(default_factory=list)
+
+
+class CapabilityPurposeOut(BaseModel):
+    id: int
+    name: str
+    summary: str = ""
+    provenance: HierarchyProvenanceOut
+
+
+class CapabilityHierarchyOut(BaseModel):
+    system_id: int
+    snapshot_id: int
+    intelligence_run: Optional[IntelligenceRunOut] = None
+    purpose: Optional[CapabilityPurposeOut] = None
+    capabilities: List[CapabilityOut] = Field(default_factory=list)
+    unclassified_elements: List[CapabilityElementOut] = Field(default_factory=list)
+    unattached_supporting: List[SupportingElementOut] = Field(default_factory=list)
+    is_mock: bool = False
 
 
 class SymbolIndexWarningOut(BaseModel):

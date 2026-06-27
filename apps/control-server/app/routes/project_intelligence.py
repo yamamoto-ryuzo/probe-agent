@@ -10,6 +10,14 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 
 from ..auth import Principal, get_system_id, require_user
+from ..capability_hierarchy import (
+    EntrypointRecord as HierarchyEntrypointRecord,
+    SymbolRecord as HierarchySymbolRecord,
+    build_hierarchy,
+    propose_capability_grouping,
+)
+from ..capability_hierarchy import PROMPT_VERSION as HIERARCHY_PROMPT_VERSION
+from ..capability_hierarchy import SCHEMA_VERSION as HIERARCHY_SCHEMA_VERSION
 from ..code_indexer import index_snapshot_files
 from ..code_mapper import (
     FeatureContext,
@@ -51,6 +59,12 @@ from ..models import (
     SourceMetadataOut,
     ExplanationAnchorOut,
     ExplanationAnchorsOut,
+    CapabilityHierarchyOut,
+    CapabilityOut,
+    CapabilityElementOut,
+    CapabilityPurposeOut,
+    SupportingElementOut,
+    HierarchyProvenanceOut,
     FeatureCodeLinkOut,
     FeatureCodeLinksOut,
     FeatureDraftOut,
@@ -1448,6 +1462,407 @@ def get_explanation_anchors(
         anchor_count=len(rows),
         anchors=[_anchor_out(r) for r in rows],
     )
+
+
+# ---------------------------------------------------------------------------
+# Source-backed capability hierarchy (Issue #56)
+# ---------------------------------------------------------------------------
+
+
+def _hierarchy_symbol_records(conn, snapshot_id: int, system_id: int):
+    rows = conn.execute(
+        """
+        SELECT cs.id AS symbol_id, cs.path, cs.qualified_name, cs.kind,
+               cs.start_line, cs.end_line, cs.symbol_source_hash,
+               ssm.id AS metadata_id, ssm.role, ssm.capability, ssm.element_type,
+               ssm.system_purpose, ssm.operation_kind, ssm.consumers,
+               ssm.state_effects, ssm.probe_value, ssm.explanation_hash
+        FROM code_symbols cs
+        LEFT JOIN symbol_source_metadata ssm ON ssm.symbol_id = cs.id
+        WHERE cs.snapshot_id = ? AND cs.system_id = ?
+        ORDER BY cs.path, cs.start_line
+        """,
+        (snapshot_id, system_id),
+    ).fetchall()
+    # code_symbols has no file_content_hash column; resolve it from the snapshot.
+    file_hash_map = _load_file_hash_map(conn, snapshot_id)
+    records = []
+    for r in rows:
+        has_meta = r["metadata_id"] is not None
+        records.append(HierarchySymbolRecord(
+            symbol_id=r["symbol_id"],
+            path=r["path"],
+            qualified_name=r["qualified_name"],
+            kind=r["kind"],
+            start_line=r["start_line"],
+            end_line=r["end_line"],
+            file_content_hash=file_hash_map.get(r["path"]),
+            symbol_source_hash=r["symbol_source_hash"],
+            has_metadata=has_meta,
+            role=r["role"],
+            capability=r["capability"],
+            element_type=r["element_type"],
+            system_purpose=r["system_purpose"],
+            operation_kind=r["operation_kind"],
+            consumers=json.loads(r["consumers"]) if r["consumers"] else [],
+            state_effects=json.loads(r["state_effects"]) if r["state_effects"] else [],
+            probe_value=r["probe_value"],
+            explanation_hash=r["explanation_hash"],
+        ))
+    return records
+
+
+def _hierarchy_entrypoint_records(conn, snapshot_id: int, system_id: int):
+    rows = conn.execute(
+        "SELECT * FROM code_entrypoints WHERE snapshot_id = ? AND system_id = ?",
+        (snapshot_id, system_id),
+    ).fetchall()
+    return [
+        HierarchyEntrypointRecord(
+            entrypoint_id=r["id"],
+            category=r["category"],
+            label=r["label"],
+            operation=r["operation"],
+            route_method=r["route_method"],
+            route_path=r["route_path"],
+            handler_symbol_id=r["handler_symbol_id"],
+            handler_path=r["handler_path"],
+            handler_qualified_name=r["handler_qualified_name"],
+            line_start=r["line_start"],
+            line_end=r["line_end"],
+        )
+        for r in rows
+    ]
+
+
+def _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, node, parent_id, now):
+    cur = conn.execute(
+        """
+        INSERT INTO capability_hierarchy_nodes
+            (system_id, snapshot_id, intelligence_run_id, parent_id, node_type,
+             name, summary, capability_key, element_role, operation_kind,
+             probe_value, supporting_kind, classification, symbol_id,
+             entrypoint_id, feature_id, system_profile_draft_id, path,
+             qualified_name, start_line, end_line, file_content_hash,
+             symbol_source_hash, explanation_hash, provenance_kind,
+             decision_method, provider, model, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            system_id, snapshot_id, run_id, parent_id, node.node_type,
+            node.name, node.summary, node.capability_key, node.element_role,
+            node.operation_kind, node.probe_value, node.supporting_kind,
+            node.classification, node.symbol_id, node.entrypoint_id,
+            node.feature_id, node.system_profile_draft_id, node.path,
+            node.qualified_name, node.start_line, node.end_line,
+            node.file_content_hash, node.symbol_source_hash, node.explanation_hash,
+            node.provenance_kind, node.decision_method, node.provider, node.model,
+            now,
+        ),
+    )
+    node_id = cur.lastrowid
+    for child in node.children:
+        _persist_hierarchy_node(conn, system_id, snapshot_id, run_id, child, node_id, now)
+    return node_id
+
+
+def _apply_grouping_assignments(built, grouping):
+    """Move successfully-assigned unclassified entrypoints into capabilities.
+
+    Reasoning-derived placements are marked provenance_kind='reasoning_llm' so
+    they stay distinct from source-authored facts. Unassigned entrypoints remain
+    unclassified (no heuristic fallback).
+    """
+    if grouping is None or grouping.error or not grouping.assignments:
+        return
+    by_ep = {n.entrypoint_id: n for n in built.unclassified_elements}
+    assigned_ids = set()
+    for assignment in grouping.assignments:
+        node = by_ep.get(assignment.entrypoint_id)
+        cap = built.capability_by_key(assignment.capability_key)
+        if node is None or cap is None:
+            continue
+        node.classification = "classified"
+        node.capability_key = assignment.capability_key
+        node.summary = assignment.reason or node.summary
+        node.provenance_kind = "reasoning_llm"
+        node.decision_method = "reasoning_llm"
+        node.provider = grouping.provider
+        node.model = grouping.model
+        cap.children.append(node)
+        assigned_ids.add(assignment.entrypoint_id)
+    built.unclassified_elements = [
+        n for n in built.unclassified_elements if n.entrypoint_id not in assigned_ids
+    ]
+
+
+def _provenance_out(row) -> HierarchyProvenanceOut:
+    return HierarchyProvenanceOut(
+        provenance_kind=row["provenance_kind"],
+        decision_method=row["decision_method"],
+        path=row["path"],
+        qualified_name=row["qualified_name"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        file_content_hash=row["file_content_hash"],
+        symbol_source_hash=row["symbol_source_hash"],
+        explanation_hash=row["explanation_hash"],
+        symbol_id=row["symbol_id"],
+        entrypoint_id=row["entrypoint_id"],
+        feature_id=row["feature_id"],
+        system_profile_draft_id=row["system_profile_draft_id"],
+        provider=row["provider"],
+        model=row["model"],
+    )
+
+
+def _element_out(row) -> CapabilityElementOut:
+    return CapabilityElementOut(
+        id=row["id"],
+        name=row["name"],
+        summary=row["summary"],
+        element_role=row["element_role"],
+        operation_kind=row["operation_kind"],
+        probe_value=row["probe_value"],
+        classification=row["classification"],
+        provenance=_provenance_out(row),
+    )
+
+
+def _supporting_out(row) -> SupportingElementOut:
+    return SupportingElementOut(
+        id=row["id"],
+        name=row["name"],
+        summary=row["summary"],
+        supporting_kind=row["supporting_kind"],
+        provenance=_provenance_out(row),
+    )
+
+
+def _load_hierarchy_out(conn, system_id, snapshot_id, run_row) -> CapabilityHierarchyOut:
+    rows = conn.execute(
+        "SELECT * FROM capability_hierarchy_nodes WHERE intelligence_run_id = ? "
+        "ORDER BY id",
+        (run_row["id"],),
+    ).fetchall()
+    by_parent: dict = {}
+    purpose_row = None
+    capability_rows = []
+    unclassified_rows = []
+    unattached_supporting_rows = []
+    for r in rows:
+        by_parent.setdefault(r["parent_id"], []).append(r)
+        if r["node_type"] == "purpose":
+            purpose_row = r
+        elif r["node_type"] == "capability":
+            capability_rows.append(r)
+        elif r["parent_id"] is None and r["node_type"] == "element":
+            unclassified_rows.append(r)
+        elif r["parent_id"] is None and r["node_type"] == "supporting":
+            unattached_supporting_rows.append(r)
+
+    capabilities = []
+    for cap in capability_rows:
+        children = by_parent.get(cap["id"], [])
+        capabilities.append(CapabilityOut(
+            id=cap["id"],
+            capability_key=cap["capability_key"],
+            name=cap["name"],
+            summary=cap["summary"],
+            provenance=_provenance_out(cap),
+            elements=[_element_out(c) for c in children if c["node_type"] == "element"],
+            supporting_elements=[
+                _supporting_out(c) for c in children if c["node_type"] == "supporting"
+            ],
+        ))
+
+    purpose = None
+    if purpose_row is not None:
+        purpose = CapabilityPurposeOut(
+            id=purpose_row["id"],
+            name=purpose_row["name"],
+            summary=purpose_row["summary"],
+            provenance=_provenance_out(purpose_row),
+        )
+
+    return CapabilityHierarchyOut(
+        system_id=system_id,
+        snapshot_id=snapshot_id,
+        intelligence_run=_intelligence_run_out(run_row),
+        purpose=purpose,
+        capabilities=capabilities,
+        unclassified_elements=[_element_out(r) for r in unclassified_rows],
+        unattached_supporting=[_supporting_out(r) for r in unattached_supporting_rows],
+        is_mock=bool(run_row["is_mock"]),
+    )
+
+
+@router.post(
+    "/repository/capability-hierarchy/generate",
+    response_model=CapabilityHierarchyOut,
+    status_code=201,
+)
+def generate_capability_hierarchy(
+    use_reasoning: bool = Query(
+        default=False,
+        description="Use a reasoning model to group unclassified API entrypoints "
+        "under existing source-authored capabilities. Fails closed (no heuristic "
+        "fallback); deterministic source-authored facts are persisted regardless.",
+    ),
+    system_id: int = Depends(get_system_id),
+) -> CapabilityHierarchyOut:
+    # Deterministic structural inputs (committed snapshot only).
+    snapshot_row, flow_symbols, files = _load_flow_inputs(system_id)
+    snapshot_id = snapshot_row["id"]
+    _ensure_entrypoints_indexed(system_id, snapshot_row, flow_symbols, files)
+
+    with get_conn() as conn:
+        symbols = _hierarchy_symbol_records(conn, snapshot_id, system_id)
+        entrypoints = _hierarchy_entrypoint_records(conn, snapshot_id, system_id)
+        draft_row = conn.execute(
+            """
+            SELECT id, name, purpose FROM system_profile_drafts
+            WHERE system_id = ? AND snapshot_id = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id, snapshot_id),
+        ).fetchone()
+
+    sp_draft = (
+        {"id": draft_row["id"], "name": draft_row["name"], "purpose": draft_row["purpose"]}
+        if draft_row is not None
+        else None
+    )
+    built = build_hierarchy(symbols, entrypoints, sp_draft)
+
+    # Optional reasoning-assisted grouping of unclassified API entrypoints.
+    grouping = None
+    error = None
+    run_provider, run_model, run_is_mock = "deterministic", "none", False
+    run_decision = "deterministic"
+    if use_reasoning:
+        run_decision = "reasoning_llm"
+        if built.unclassified_elements and built.capabilities:
+            llm_config = _resolve_intelligence_config()
+            try:
+                if llm_config.provider != "mock" and not is_reasoning_model(
+                    llm_config.provider, llm_config.model
+                ):
+                    raise LLMError(
+                        "Capability grouping requires a configured reasoning model"
+                    )
+                client = create_llm_client(llm_config)
+                grouping = propose_capability_grouping(
+                    client, llm_config, built.capabilities, built.unclassified_elements
+                )
+            except LLMError as exc:
+                grouping = type("R", (), {
+                    "provider": llm_config.provider,
+                    "model": llm_config.model,
+                    "is_mock": llm_config.provider == "mock",
+                    "assignments": [],
+                    "error": str(exc),
+                })()
+            run_provider, run_model = grouping.provider, grouping.model
+            run_is_mock = grouping.is_mock
+            error = grouping.error
+            _apply_grouping_assignments(built, grouping)
+        else:
+            # Nothing to group; the reasoning run is a no-op but still recorded.
+            llm_config = _resolve_intelligence_config()
+            run_provider, run_model = llm_config.provider, llm_config.model
+            run_is_mock = llm_config.provider == "mock"
+
+    status = "failed" if error else "completed"
+    started_at = time.time()
+    completed_at = started_at
+
+    with get_conn() as conn:
+        conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO intelligence_runs
+                    (system_id, snapshot_id, run_type, provider, model,
+                     prompt_version, schema_version, decision_method,
+                     status, error_details, is_mock, started_at, completed_at)
+                VALUES (?, ?, 'capability_hierarchy', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    system_id, snapshot_id, run_provider, run_model,
+                    HIERARCHY_PROMPT_VERSION, HIERARCHY_SCHEMA_VERSION,
+                    run_decision, status, error, 1 if run_is_mock else 0,
+                    started_at, completed_at,
+                ),
+            )
+            run_id = cur.lastrowid
+
+            # Persist deterministic results even when the reasoning step failed
+            # (fail closed only suppresses guessed groupings, not source facts).
+            now = time.time()
+            if built.purpose is not None:
+                purpose_id = _persist_hierarchy_node(
+                    conn, system_id, snapshot_id, run_id, built.purpose, None, now
+                )
+            else:
+                purpose_id = None
+            for cap in built.capabilities:
+                _persist_hierarchy_node(
+                    conn, system_id, snapshot_id, run_id, cap, purpose_id, now
+                )
+            for node in built.unclassified_elements:
+                _persist_hierarchy_node(
+                    conn, system_id, snapshot_id, run_id, node, None, now
+                )
+            for node in built.unattached_supporting:
+                _persist_hierarchy_node(
+                    conn, system_id, snapshot_id, run_id, node, None, now
+                )
+
+            run_row = conn.execute(
+                "SELECT * FROM intelligence_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            out = _load_hierarchy_out(conn, system_id, snapshot_id, run_row)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    return out
+
+
+@router.get(
+    "/repository/capability-hierarchy",
+    response_model=CapabilityHierarchyOut,
+)
+def get_capability_hierarchy(
+    system_id: int = Depends(get_system_id),
+) -> CapabilityHierarchyOut:
+    with get_conn() as conn:
+        snapshot_row = conn.execute(
+            """
+            SELECT * FROM repository_snapshots
+            WHERE system_id = ? ORDER BY id DESC LIMIT 1
+            """,
+            (system_id,),
+        ).fetchone()
+        if snapshot_row is None:
+            return CapabilityHierarchyOut(system_id=system_id, snapshot_id=0)
+        snapshot_id = snapshot_row["id"]
+        run_row = conn.execute(
+            """
+            SELECT * FROM intelligence_runs
+            WHERE system_id = ? AND snapshot_id = ? AND run_type = 'capability_hierarchy'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (system_id, snapshot_id),
+        ).fetchone()
+        if run_row is None:
+            return CapabilityHierarchyOut(
+                system_id=system_id, snapshot_id=snapshot_id,
+            )
+        return _load_hierarchy_out(conn, system_id, snapshot_id, run_row)
 
 
 # ---------------------------------------------------------------------------
